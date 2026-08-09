@@ -34,6 +34,23 @@
 #include "tensorrt_llm/runtime/utils/speculativeChoicesUtils.h"
 
 #include "tensorrt_llm/common/tllmDataType.h"
+// ============================================================================
+// 【中文讲解 · 解码请求创建 createNewDecoderRequests】（本文件为学习用途添加）
+//
+// 对应文档：docs/source/developer-guide/overview.md（PyExecutor 迭代流程）
+//
+// 职责：PyExecutor 单步循环中"输出处理"阶段的实现——
+//       把模型前向产出的 logits 转换为每个请求的最终输出：
+//   1. 更新进行中请求的部分输出（partial outputs）；
+//   2. 检查停止条件（stop criteria：EOS token、max_tokens、stop words）；
+//   3. 标记完成的请求（GENERATION_COMPLETE），准备返回给用户；
+//   4. 为已完成请求释放资源（KV cache、采样器状态等）。
+//
+// 这里的逻辑对应 PyExecutor 循环的最后一环：
+//   取请求 → 调度 → forward → 采样 → 【本文件：输出处理与收尾】
+// 注意与 Decoder/Sampler 的分工：采样器决定"下一个 token 是什么"，
+// 本文件决定"这轮生成是否结束、结果怎么回填"。
+// ============================================================================
 
 using namespace tensorrt_llm::runtime;
 

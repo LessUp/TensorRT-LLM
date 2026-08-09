@@ -44,6 +44,34 @@
 #include <sstream>
 #include <utility>
 
+// ============================================================================
+// 【中文讲解 · KV Cache 管理器 KVCacheManager】（本文件为学习用途添加，英文原注释保留）
+//
+// 对应文档：docs/source/features/kvcache.md（KV Cache 系统）、
+//           docs/source/torch/kv_cache_manager.md（接口层）、
+//           docs/source/features/paged-attention-ifb-scheduler.md（分页思想）
+//
+// 职责：管理 KV cache 的"一生"——分配（allocate）、填充（store）、复用（reuse）、
+//       驱逐（evict）、释放（free）。这是推理引擎显存管理的核心组件。
+//
+// 关键概念（与文档对应）：
+//   1. 块（Block）：显存分配的最小单位，一个块装固定数量 token（2 的幂）的 K/V；
+//   2. 块池（Pool）：所有块组成的池，按 (窗口大小, KV 头数) 分组；
+//   3. Radix 树（radixBlockTree）：前缀复用——相同前缀的 KV 只存一份，
+//      新请求命中前缀直接复用（对应 kvcache.md 的"跨请求复用"）；
+//   4. 驱逐（Eviction）：显存不足时按优先级 LRU 踢出块（对应 EvictionPolicy）；
+//   5. 卸载（Offload）：GPU 显存不足时把块搬到主机内存（secondary memory）。
+//
+// 核心方法速览：
+//   - addSequenceBatch / storeNewBlock：给请求分配/填充 KV 块
+//   - analyzePrefixReuse：检查前缀命中（复用判断的入口）
+//   - storeBlocksForReuse / removeSequence：块回收与复用登记
+//   - startScheduling：调度前初始化（与 capacityScheduler.cpp 联动）
+//
+// 注意：这是 V1 实现；kv_cache_manager_v2/ 目录下有更新版本的 V2 管理器
+// （PyTorch 后端默认走 V2，见 use_kv_cache_manager_v2 配置）。
+// ============================================================================
+
 namespace tc = tensorrt_llm::common;
 namespace tk = tensorrt_llm::kernels;
 namespace tle = tensorrt_llm::executor;

@@ -28,6 +28,25 @@
 #include <algorithm>
 #include <stdexcept>
 #include <unordered_set>
+// ============================================================================
+// 【中文讲解 · KV Cache V2 管理器：kvCache.cpp】（本文件为学习用途添加，英文原注释保留）
+//
+// 对应文档：docs/source/features/kvcache.md、docs/source/torch/kv_cache_manager.md
+//
+// 这是 V2 KV cache 管理器（PyTorch 后端默认使用，配置 use_kv_cache_manager_v2）
+// 的"块操作"核心实现文件。V2 相对 V1（kvCacheManager.cpp）的改进：
+//   1. 更细粒度的存储抽象：CacheLevel（GPU 显存 / 主机内存两级）+
+//      StorageManager（统一管理各级池）；
+//   2. 显式的复制引擎（copyEngine）：块复制/恢复（resume）操作集中实现，
+//      支持 GPU→GPU 部分块复制；
+//   3. 支持混合 Mamba 模型的状态快照（_snapshotSsmToTreeBlock 等），
+//      这是 V1 没有的能力（见 kvcache.md 的 Mamba Snapshot Boundaries）。
+//
+// 核心概念对应关系：
+//   - Slot：V2 中块的基本单位（一个 slot = 一个物理存储槽位）；
+//   - PoolGroup：按 (窗口大小, KV 头数) 分组的池组（与 V1 的 pool 对应）；
+//   - BlockRadixTree：前缀复用树（对应 kvcache.md 的 radix search tree）。
+// ============================================================================
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {

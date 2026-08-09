@@ -1,15 +1,26 @@
-# Guided Decoding
+<!--
+  本文档为 TensorRT-LLM 官方 Guided Decoding 文档的中文翻译版（AI 翻译，翻译日期 2026-08-07）。
+  英文原文可从 git 历史恢复：git checkout HEAD -- docs/source/features/guided-decoding.md
+-->
 
-Guided decoding (or interchangeably constrained decoding, structured generation) guarantees that the LLM outputs are amenable to a user-specified grammar (e.g., JSON schema, [regular expression](https://en.wikipedia.org/wiki/Regular_expression) or [EBNF](https://en.wikipedia.org/wiki/Extended_Backus%E2%80%93Naur_form) grammar).
+# 引导解码（Guided Decoding）
 
-TensorRT LLM supports two grammar backends:
-* [XGrammar](https://github.com/mlc-ai/xgrammar/blob/v0.1.21/python/xgrammar/matcher.py#L341-L350): Supports JSON schema, regular expression, EBNF and [structural tag](https://xgrammar.mlc.ai/docs/structural_tag/structural_tag_api.html).
-* [LLGuidance](https://github.com/guidance-ai/llguidance/blob/v1.1.1/python/llguidance/_lib.pyi#L363-L366): Supports JSON schema, regular expression, EBNF.
+引导解码（也称受约束解码 constrained decoding、结构化生成 structured generation）保证 LLM 输出符合用户指定的语法（例如 JSON schema、[正则表达式](https://en.wikipedia.org/wiki/Regular_expression) 或 [EBNF](https://en.wikipedia.org/wiki/Extended_Backus%E2%80%93Naur_form) 文法）。
 
+> 💡 **AI Infra 视角**：为什么需要引导解码？LLM 是"概率地输出 token"，**不保证格式**——让它输出 JSON 它可能给多行注释，让它输出数字它可能给 "大约 100 万"。而生产应用（API 后端、Agent 工具调用、数据库查询生成）要求**格式必须合法**。两种实现路线：
+> - **事后修补（reparsing）**：生成完再解析/重试——浪费 token、延迟高、不保证成功；
+> - **引导解码（guided decoding）**：**采样时就把不合法 token 屏蔽掉**——每步只从"符合语法的 token"里采样，输出天然合法（也叫 grammar-constrained sampling）。
+> 实现原理：把语法（JSON schema/正则/EBNF）编译成一个**token 级状态机**，每步根据当前状态算出"下一个允许的 token 集合"，采样时只允许这些。XGrammar（MLC 出品）的核心就是这种**grammar → 状态机 → 掩码**的流水线，且做了缓存和并行优化。
 
-## Online API: `trtllm-serve`
+TensorRT LLM 支持两个文法后端：
+* [XGrammar](https://github.com/mlc-ai/xgrammar/blob/v0.1.21/python/xgrammar/matcher.py#L341-L350)：支持 JSON schema、正则表达式、EBNF 和[结构化标签（structural tag）](https://xgrammar.mlc.ai/docs/structural_tag/structural_tag_api.html)。
+* [LLGuidance](https://github.com/guidance-ai/llguidance/blob/v1.1.1/python/llguidance/_lib.pyi#L363-L366)：支持 JSON schema、正则表达式、EBNF。
 
-If you are using `trtllm-serve`, enable guided decoding by specifying `guided_decoding_backend` with `xgrammar` or `llguidance` in the YAML configuration file, and pass it to `--config`. For example,
+> 💡 **AI Infra 视角**：两个后端的区别：XGrammar（MLC AI 开源）功能更全（支持 structural tag，且对新格式适配快）；LLGuidance（Microsoft guidance 生态）专注 JSON/正则/EBNF。**生产选型看场景**：需要函数调用标签控制选 XGrammar，常规 JSON 输出两者都行。注意引导解码有性能开销（每步计算掩码），短输出场景开销可忽略，长结构化输出要考虑。
+
+## 在线 API：`trtllm-serve`
+
+如果你使用 `trtllm-serve`，在 YAML 配置文件中用 `xgrammar` 或 `llguidance` 指定 `guided_decoding_backend`，并通过 `--config` 传入。例如：
 
 ```{eval-rst}
 .. include:: ../_includes/note_sections.rst
@@ -25,7 +36,7 @@ EOF
 trtllm-serve nvidia/Llama-3.1-8B-Instruct-FP8 --config config.yaml
 ```
 
-You should see a log like the following, which indicates the grammar backend is successfully enabled.
+你应该会看到类似下面的日志，表示文法后端已成功启用。
 
 ```txt
 ......
@@ -35,7 +46,7 @@ You should see a log like the following, which indicates the grammar backend is 
 
 ### JSON Schema
 
-Define a JSON schema and pass it to `response_format` when creating the OpenAI chat completion request. Alternatively, the JSON schema can be created using [pydantic](https://docs.pydantic.dev/latest/).
+定义 JSON schema 并在创建 OpenAI chat completion 请求时通过 `response_format` 传入。或者，JSON schema 可以用 [pydantic](https://docs.pydantic.dev/latest/) 创建。
 
 ```python
 from openai import OpenAI
@@ -82,7 +93,7 @@ message = chat_completion.choices[0].message
 print(message.content)
 ```
 
-The output would look like:
+输出看起来像：
 ```txt
 {
     "name": "Paris",
@@ -90,9 +101,11 @@ The output would look like:
 }
 ```
 
-### Regular expression
+> 💡 **AI Infra 视角**：**JSON mode 是 AI 应用对接的刚需**——Agent 框架、结构化数据抽取、RAG 后处理全都要。注意 response 里连缩进都合法（schema 只约束结构）。**OpenAI 兼容 API 的 `response_format` 字段**已被各引擎（vLLM、SGLang 等都支持）当作事实标准——作为引擎开发者要兼容这个字段的语义。
 
-Define a regular expression and pass it to `response_format` when creating the OpenAI chat completion request.
+### 正则表达式
+
+定义正则表达式并在创建 OpenAI chat completion 请求时通过 `response_format` 传入。
 
 ```python
 from openai import OpenAI
@@ -126,14 +139,14 @@ message = chat_completion.choices[0].message
 print(message.content)
 ```
 
-The output would look like:
+输出看起来像：
 ```txt
 Paris
 ```
 
-### EBNF grammar
+### EBNF 文法
 
-Define an EBNF grammar and pass it to `response_format` when creating the OpenAI chat completion request.
+定义 EBNF 文法并在创建 OpenAI chat completion 请求时通过 `response_format` 传入。
 
 ```python
 from openai import OpenAI
@@ -173,17 +186,18 @@ message = chat_completion.choices[0].message
 print(message.content)
 ```
 
-The output would look like:
+输出看起来像：
 ```txt
 Paris is the capital of France
 ```
 
-### Structural tag
+> 💡 **AI Infra 视角**：EBNF 是比 JSON schema/正则更通用的**文法描述语言**（编程语言语法就是用 EBNF 描述的）。注意这个例子演示了引导解码的"递归约束"：`description ::= city " is " status` 定义了完整的句子结构，模型输出的每个 token 都必须符合这个结构。**"输出长度受限的填空式生成"（如 SQL 查询、公式、代码片段）用 EBNF 最灵活**。
 
-Define a structural tag and pass it to `response_format` when creating the OpenAI chat completion request.
+### 结构化标签（Structural tag）
 
-Structural tag is supported by `xgrammar` backend only. It is a powerful and flexible tool to represent the LLM output constraints. Please see [structural tag usage](https://xgrammar.mlc.ai/docs/structural_tag/structural_tag_api.html) for a comprehensive tutorial. Below is an example of function calling with customized function call format for `Llama-3.1-8B-Instruct`.
+定义结构化标签并在创建 OpenAI chat completion 请求时通过 `response_format` 传入。
 
+结构化标签只由 `xgrammar` 后端支持。它是表达 LLM 输出约束的强大而灵活的工具。完整的教程请看[结构化标签用法](https://xgrammar.mlc.ai/docs/structural_tag/structural_tag_api.html)。下面是一个为 `Llama-3.1-8B-Instruct` 自定义函数调用格式的示例。
 
 ```python
 from openai import OpenAI
@@ -309,16 +323,18 @@ message = chat_completion.choices[0].message
 print(message.content)
 ```
 
-The output would look like:
+输出看起来像：
 ```txt
 <function=get_current_date>{"timezone": "America/New_York"}</function>
 <function=get_current_weather>{"city": "New York", "state": "NY", "unit": "fahrenheit"}</function>
 ```
 
+> 💡 **AI Infra 视角**：structural tag 是**函数调用（function calling / tool use）场景**的利器——Agent 应用的核心需求。原理：定义"触发词"（`<function=`）和每个函数的"开始标签 → JSON 参数 schema → 结束标签"。模型一旦输出 `<function=`，后面的内容就**强制**符合对应函数的 JSON schema——保证 Agent 框架解析函数调用永不失败。
+> 对比 OpenAI 原生 function calling：它靠模型训练对齐，输出仍可能格式错误；structural tag 是**硬约束**，100% 合法。**"结构化输出保证"是现代 Agent 基础设施（如 OpenAI Responses API、MCP）的底层需求**。
 
-## Offline API: LLM API
+## 离线 API：LLM API
 
-If you are using LLM API, enable guided decoding by specifying `guided_decoding_backend` with `xgrammar` or `llguidance` when creating the LLM instance. For example,
+如果你使用 LLM API，在创建 LLM 实例时用 `xgrammar` 或 `llguidance` 指定 `guided_decoding_backend` 来启用引导解码。例如：
 
 ```python
 from tensorrt_llm import LLM
@@ -328,7 +344,7 @@ llm = LLM("nvidia/Llama-3.1-8B-Instruct-FP8", guided_decoding_backend="xgrammar"
 
 ### JSON Schema
 
-Create a `GuidedDecodingParams` with the `json` field specified with a JSON schema, use it to create `SamplingParams`, and then pass to `llm.generate` or `llm.generate_async`. Alternatively, the JSON schema can be created using [pydantic](https://docs.pydantic.dev/latest/).
+创建带 `json` 字段（指定 JSON schema）的 `GuidedDecodingParams`，用它创建 `SamplingParams`，然后传给 `llm.generate` 或 `llm.generate_async`。或者，JSON schema 可以用 [pydantic](https://docs.pydantic.dev/latest/) 创建。
 
 ```python
 from tensorrt_llm import LLM
@@ -369,7 +385,7 @@ if __name__ == "__main__":
     print(output.outputs[0].text)
 ```
 
-The output would look like:
+输出看起来像：
 ```txt
 {
   "name": "Paris",
@@ -377,10 +393,11 @@ The output would look like:
 }
 ```
 
+> 💡 **AI Infra 视角**：注意 LLM API 的用法结构：`GuidedDecodingParams(json=...)` 是**采样参数的一部分**（SamplingParams 里），说明引导解码在实现上就是采样阶段的一个约束器（sampling.md 里 logits processor 那一层的近亲）。API 设计启示：**引导解码是"按请求粒度"的能力**——同一个服务里，一个请求要 JSON、另一个请求自由生成，互不影响。
 
-### Regular expression
+### 正则表达式
 
-Create a `GuidedDecodingParams` with the `regex` field specified with a regular expression, use it to create `SamplingParams`, and then pass to `llm.generate` or `llm.generate_async`.
+创建带 `regex` 字段（指定正则表达式）的 `GuidedDecodingParams`，用它创建 `SamplingParams`，然后传给 `llm.generate` 或 `llm.generate_async`。
 
 ```python
 from tensorrt_llm import LLM
@@ -408,14 +425,14 @@ if __name__ == "__main__":
     print(output.outputs[0].text)
 ```
 
-The output would look like:
+输出看起来像：
 ```txt
 Paris
 ```
 
-### EBNF grammar
+### EBNF 文法
 
-Create a `GuidedDecodingParams` with the `grammar` field specified with an EBNF grammar, use it to create `SamplingParams`, and then pass to `llm.generate` or `llm.generate_async`.
+创建带 `grammar` 字段（指定 EBNF 文法）的 `GuidedDecodingParams`，用它创建 `SamplingParams`，然后传给 `llm.generate` 或 `llm.generate_async`。
 
 ```python
 from tensorrt_llm import LLM
@@ -449,16 +466,16 @@ country ::= "England" | "France" | "Germany" | "Italy"
     print(output.outputs[0].text)
 ```
 
-The output would look like:
+输出看起来像：
 ```txt
 Paris is the capital of France
 ```
 
-### Structural tag
+### 结构化标签
 
-Create a `GuidedDecodingParams` with the `structural_tag` field specified with a structural tag string, use it to create `SamplingParams`, and then pass to `llm.generate` or `llm.generate_async`.
+创建带 `structural_tag` 字段（指定结构化标签字符串）的 `GuidedDecodingParams`，用它创建 `SamplingParams`，然后传给 `llm.generate` 或 `llm.generate_async`。
 
-Structural tag is supported by `xgrammar` backend only. It is a powerful and flexible tool to represent the LLM output constraints. Please see [structural tag usage](https://xgrammar.mlc.ai/docs/structural_tag/structural_tag_api.html) for a comprehensive tutorial. Below is an example of function calling with customized function call format for `Llama-3.1-8B-Instruct`.
+结构化标签只由 `xgrammar` 后端支持。它是表达 LLM 输出约束的强大而灵活的工具。完整的教程请看[结构化标签用法](https://xgrammar.mlc.ai/docs/structural_tag/structural_tag_api.html)。下面是一个为 `Llama-3.1-8B-Instruct` 自定义函数调用格式的示例。
 
 ```python
 import json
@@ -582,8 +599,10 @@ You are a helpful assistant."""
     print(output.outputs[0].text)
 ```
 
-The output would look like:
+输出看起来像：
 ```txt
 <function=get_current_date>{"timezone": "America/New_York"}</function>
 <function=get_current_weather>{"city": "New York", "state": "NY", "unit": "fahrenheit"}</function>
 ```
+
+> 💡 **AI Infra 视角**：读完这篇你应能总结引导解码的完整使用姿势：在线服务 = `guided_decoding_backend` 配置 + `response_format` 请求参数；离线 = 构造时指定 backend + `GuidedDecodingParams`。支持的约束类型由后端决定（JSON schema 通用，structural tag 只有 XGrammar）。**面试/工作中"怎么保证 LLM 输出格式合法"的标准答案就是引导解码**——它比 prompt 指令（"please output JSON"）+ 事后重试（retry）可靠得多。

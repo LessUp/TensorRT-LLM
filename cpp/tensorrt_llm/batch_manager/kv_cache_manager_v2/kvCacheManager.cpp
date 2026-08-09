@@ -30,6 +30,23 @@
 #include <map>
 #include <numeric>
 #include <stdexcept>
+// ============================================================================
+// 【中文讲解 · KV Cache V2 管理器：kvCacheManager.cpp】（本文件为学习用途添加）
+//
+// 对应文档：docs/source/features/kvcache.md、docs/source/torch/kv_cache_manager.md
+//
+// V2 管理器的"调度与管理"入口文件（与 kvCache.cpp 的块操作互补）：
+//   1. 实现 BaseResourceManager 接口（prepare/update/free_resources），
+//      与 PyExecutor 的单步循环对接（见 torch/arch_overview.md）；
+//   2. 实现 CapacityScheduler 用的资源查询接口
+//      （get_max_resource_count / get_needed_resource_to_completion）；
+//   3. 池的初始化与显存预算计算（按 max_seq_len、tokens_per_block 等
+//      划分 KV cache 与 Mamba 状态池的比例，见 kvcache.md 的 avg_seq_len）；
+//   4. 块复用（prefix reuse）策略与驱逐策略的实现。
+//
+// 学习建议：先读 V1（kvCacheManager.cpp）理解基本流程，
+// 再读本文件看 V2 的架构差异（存储分层、复制引擎、Mamba 支持）。
+// ============================================================================
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {

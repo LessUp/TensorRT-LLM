@@ -1,135 +1,166 @@
-# Disaggregated Serving
+<!--
+  本文档为 TensorRT-LLM 官方 Disaggregated Serving 文档的中文翻译版（AI 翻译，翻译日期 2026-08-07）。
+  英文原文可从 git 历史恢复：git checkout HEAD -- docs/source/features/disagg-serving.md
+-->
 
-- [Motivation](#Motivation)
-- [KV Cache Exchange](#KV-Cache-Exchange)
-  - [Multi-backend Support](#Multi-backend-Support)
-  - [NIXL Backend Configuration](#nixl-backend-configuration)
-  - [Overlap Optimization](#Overlap-Optimization)
-  - [Cache Layout Transformation](#Cache-Layout-Transformation)
-  - [Unique Global Request ID](#Unique-Global-Request-ID)
-- [Usage](#Usage)
+# 分离式服务（Disaggregated Serving）
+
+- [动机](#Motivation)
+- [KV Cache 交换](#KV-Cache-Exchange)
+  - [多后端支持](#Multi-backend-Support)
+  - [NIXL 后端配置](#nixl-backend-configuration)
+  - [重叠优化](#Overlap-Optimization)
+  - [缓存布局转换](#Cache-Layout-Transformation)
+  - [唯一全局请求 ID](#Unique-Global-Request-ID)
+- [用法](#Usage)
   - [Dynamo](#Dynamo)
   - [trtllm-serve](#trtllm-serve)
-  - [Multiple Instances](#multiple-instances)
-- [Environment Variables](#Environment-Variables)
-- [Troubleshooting and FAQ](#Troubleshooting-and-FAQ)
+  - [多实例](#multiple-instances)
+- [环境变量](#Environment-Variables)
+- [故障排查与 FAQ](#Troubleshooting-and-FAQ)
 
-## Motivation
+## 动机
 
-LLM inference has two stages: context (prefill) and generation (decode) phases. The context phase computes KV cache for prompt tokens whereas the generation phase generates tokens one by one using cached values. These phases have different compute characteristics.
+LLM 推理有两个阶段：上下文（context/prefill）和生成（generation/decode）阶段。上下文阶段计算 prompt token 的 KV cache，而生成阶段使用缓存值逐个生成 token。这两个阶段的计算特性不同。
 
-There are two ways of serving LLM inference requests:
+> 💡 **AI Infra 视角**：两个阶段的"性格"完全不同（这是全文的理论基础）：
+> - **prefill**：**计算密集 + 大 batch**——一次性算完整个 prompt 的 attention，可以并行度拉满（矩阵乘大），但响应慢（可能几秒）；
+> - **decode**：**显存带宽密集 + 小计算**——每步只算 1 个 token 的 attention，矩阵乘很小，主要瓶颈是把巨大的 KV cache 读进来。
+> 两者对硬件、并行策略、batch 大小的最优解都不同——**把两个阶段绑在同一个 GPU 上，本质是让两个性格不合的人合租**。
 
-* Aggregated LLM serving (sometimes called in-flight batching or IFB in this tech blog), in which the context and generation phases are run on the same GPU.
-* Disaggregated LLM serving, in which the context and generation phases are run on different GPUs.
+LLM 推理请求有两种服务方式：
+
+* **聚合式 LLM 服务**（aggregated serving，本技术博客中也称为 in-flight batching 或 IFB），上下文和生成阶段在同一个 GPU 上运行。
+* **分离式 LLM 服务**（disaggregated serving），上下文和生成阶段在不同的 GPU 上运行。
 
 <div align="center">
 <figure>
   <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture1.png" width="640" height="auto">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 1. The execution timeline of aggregated LLM serving</em></sub></p>
+<p align="center"><sub><em>图 1. 聚合式 LLM 服务的执行时间线</em></sub></p>
 
-In aggregated LLM serving, both the context and generation phases share the same GPU resources and parallelism strategy. This can lead to interference where context processing delays token generation, increasing token-to-token latency (TPOT) and reducing interactivity. This is illustrated in Figure 1 which shows the execution timeline for aggregated LLM serving. Aggregated LLM serving also forces a single GPU type and parallelism configuration for both phases, even though their compute needs differ. As a result, optimizing for one metric such as time-to-first-token (TTFT), often comes at the expense of another metric such as TPOT.
+在聚合式 LLM 服务中，上下文和生成阶段共享相同的 GPU 资源和并行策略。这可能导致干扰（interference）：上下文处理会延迟 token 生成，增加 token 间延迟（TPOT）并降低交互性。图 1 展示了聚合式 LLM 服务的执行时间线。聚合式服务还迫使两个阶段使用单一 GPU 类型和并行配置，尽管它们的计算需求不同。结果是，优化一个指标（如首 token 时间 TTFT）往往以牺牲另一个指标（如 TPOT）为代价。
+
+> 💡 **AI Infra 视角**：**"干扰"是聚合式服务的核心痛点**：一个 32K 长 prompt 的 prefill 进来，会瞬间占满 GPU——正在生成的用户立刻卡顿（TPOT 飙升）。这就是为什么"长输入场景下服务质量不稳定"。**TTFT 和 TPOT 的矛盾**：想压低 TTFT（prefill 优先），decode 就受害；想保 TPOT（decode 优先），prefill 排队 TTFT 变长。聚合式服务只能在两者之间做跷跷板。
 
 <div align="center">
 <figure>
   <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture2.png" width="580" height="auto">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 2. The execution timeline of dis-aggregated LLM serving</em></sub></p>
+<p align="center"><sub><em>图 2. 分离式 LLM 服务的执行时间线</em></sub></p>
 
-Disaggregated serving resolves these challenges by decoupling the two phases, allowing each to run on separate GPU pools and using different parallelism strategies. This separation removes the interference between context and generation phases, as shown in Figure 2, and enables independent optimization of TTFT and TPOT. Although disaggregation incurs overhead for transferring the KV cache blocks from context to generation GPUs, the advantages can be substantial—particularly for workloads with long input sequences and moderate output lengths where interference is most severe.
+分离式服务通过解耦两个阶段解决这些挑战：每个阶段运行在独立的 GPU 池上，并使用不同的并行策略。这种分离消除了上下文和生成阶段之间的干扰，如图 2 所示，并支持对 TTFT 和 TPOT 独立优化。虽然分离会带来将 KV cache 块从上下文 GPU 传输到生成 GPU 的开销，但优势可能很大——特别是对于**长输入序列 + 中等输出长度**的工作负载，这种场景下干扰最严重。
 
-You can also refer to [this paper](https://arxiv.org/pdf/2506.05508) for more details about the rationale and design considerations of disaggregated serving.
+> 💡 **AI Infra 视角**：分离式服务的成本收益分析（面试加分点）：
+> - **成本**：KV cache 要从 prefill 卡传到 decode 卡（网络/互联带宽开销）+ 部署复杂度上升（两套池子、编排器）；
+> - **收益**：① TTFT/TPOT 独立优化（prefill 池专注压 TTFT，decode 池专注压 TPOT）；② 资源按需分配（prefill 卡和 decode 卡 1:2 甚至 1:3 配比，因为 decode 阶段长得多）；③ 长输入不干扰生成。
+> - **最佳场景**：长输入 + 中等输出（如 RAG 应用、Agent 多轮）——prefill 占比高、干扰严重，分离收益最大。
+> **注意：分离式服务不是新概念**——这是从传统 Web 架构（前端/后端分离、读写分离）借来的"职责分离"思想。业界 2024 年起主流化（DeepSeek 的部署架构也用）。
 
-## KV Cache Exchange
+你也可以参考[这篇论文](https://arxiv.org/pdf/2506.05508)了解分离式服务的原理和设计考虑的更多细节。
 
-### Multi-backend Support
+## KV Cache 交换
 
-In TensorRT-LLM, the KV cache exchange is modularly decoupled from the KV cache manager and the underlying communication libraries, as shown in Figure 3. The KV cache exchange module is responsible for efficient transmission and reception of the cache, promptly releasing cache space, and performing cache layout conversions during the exchange process. Currently, mainstream communication protocols—MPI, UCX, and NIXL—are all supported by TensorRT-LLM, and the underlying communication protocols utilize RDMA / NVLink. Currently, we recommend using UCX and NIXL backends, as we are adding a dynamic scaling mechanism on top of them—specifically, dynamic node joining and leaving. This allows customers to adjust the load based on traffic demands or switch roles between context and generation dynamically.
+### 多后端支持
+
+在 TensorRT-LLM 中，KV cache 交换模块与 KV cache 管理器和底层通信库是模块化解耦的，如图 3 所示。KV cache 交换模块负责缓存的高效发送和接收、及时释放缓存空间，以及在交换过程中执行缓存布局转换。目前，主流通信协议——MPI、UCX 和 NIXL——都被 TensorRT-LLM 支持，底层通信协议利用 RDMA / NVLink。目前我们推荐使用 UCX 和 NIXL 后端，因为我们正在它们之上添加动态扩缩容机制——具体来说，就是动态节点加入和离开。这让客户可以根据流量需求调整负载，或在上下文和生成角色之间动态切换。
 
 <div align="center">
 <figure>
   <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture6.png" width="890" height="auto">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 3. KV cache exchange architecture</em></sub></p>
+<p align="center"><sub><em>图 3. KV cache 交换架构</em></sub></p>
 
-### NIXL Backend Configuration
+> 💡 **AI Infra 视角**：KV cache 传输走的是什么链路？
+> - **节点内**：NVLink（GPU 到 GPU 直连，几百 GB/s）——快；
+> - **节点间**：RDMA over InfiniBand（网卡到网卡直通，绕过 CPU，200~400 Gb/s）——也很快。
+> 注意 RDMA 的关键特性：**数据不经过 CPU 和内核**，网卡直接从 GPU 显存搬数据（GPU Direct RDMA）——省掉两次拷贝。传输协议层：MPI（老）、UCX（通用中间层）、NIXL（NVIDIA 新自研）。**"谁来做零拷贝传输"是高性能分布式系统的核心工程问题**。
 
-NIXL supports multiple underlying communication backends for KV cache exchange in disaggregated serving. The backend can be configured using the `TRTLLM_NIXL_KVCACHE_BACKEND` environment variable.
+### NIXL 后端配置
 
-**Supported NIXL backends:**
-- **UCX** (default)
-- **LIBFABRIC** (available from v0.16.0)
+NIXL 支持多种底层通信后端用于分离式服务中的 KV cache 交换。后端可以通过 `TRTLLM_NIXL_KVCACHE_BACKEND` 环境变量配置。
 
-If an unsupported backend is specified, NIXL will automatically fall back to UCX.
+**支持的 NIXL 后端：**
+- **UCX**（默认）
+- **LIBFABRIC**（从 v0.16.0 起可用）
 
-For detailed setup instructions and configuration examples, please refer to the [disaggregated serving examples documentation](../../../examples/disaggregated/README.md).
+如果指定了不支持的后端，NIXL 会自动回退到 UCX。
 
-### Overlap Optimization
+详细的设置说明和配置示例，请参考[分离式服务示例文档](../../../examples/disaggregated/README.md)。
 
-To optimize the overall performance of disaggregated serving, TensorRT LLM overlaps the KV cache transmission with computation for multiple independent requests. While one request is sending or receiving its KV cache blocks, other requests can proceed with computation, as illustrated in Figure 4. Furthermore, if context and generation instances are using multiple GPUs per instance, KV cache transmission between different sets of GPUs can occur in parallel.
+### 重叠优化
+
+为优化分离式服务的整体性能，TensorRT LLM 将 KV cache 传输与多个独立请求的计算重叠。当一个请求在发送或接收其 KV cache 块时，其他请求可以继续计算，如图 4 所示。此外，如果上下文和生成实例每个实例使用多个 GPU，不同 GPU 组之间的 KV cache 传输可以并行进行。
 
 <div align="center">
 <figure>
   <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture7.png" width="800" height="auto">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 4. KV cache exchange timing diagram</em></sub></p>
+<p align="center"><sub><em>图 4. KV cache 交换时序图</em></sub></p>
 
-### Cache Layout Transformation
+> 💡 **AI Infra 视角**：传输开销被"藏"起来的手段：多个请求错开传输（请求 A 传 KV 时，请求 B 在算）——和 Overlap Scheduler 的 CPU/GPU 重叠是同一思想的不同层面。**"凡是等待都可以被重叠掩盖"是高性能系统的通用原则**。
 
-To minimize KV cache transmission latency, TensorRT LLM currently uses direct transmission between device memories for cache transfer. The KV cache transmission supports using different parallel strategies for the context and generation phases. In such cases, careful orchestration of KV cache block mapping is required. Figure 5 illustrates this using the example of context phase with TP2 and generation phase with PP2.
+### 缓存布局转换
+
+为最小化 KV cache 传输延迟，TensorRT LLM 目前使用设备显存之间的直接传输进行缓存交换。KV cache 传输支持上下文和生成阶段使用**不同的并行策略**。这种情况下，需要仔细编排 KV cache 块映射。图 5 以上下文阶段 TP2、生成阶段 PP2 为例说明。
 
 <div align="center">
 <figure>
   <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture8.png" width="680" height="auto">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 5. KV cache layout conversion</em></sub></p>
+<p align="center"><sub><em>图 5. KV cache 布局转换</em></sub></p>
 
-The optimizations required for KV cache transmission vary depending on whether it's single-node multi-GPU, multi-node multi-GPU, or different GPU models. To accommodate this, TensorRT LLM provides a set of environment variables for selection in different environments. Please refer to the following section for details [Environment Variables](#Environment-Variables).
+> 💡 **AI Infra 视角**：这是分离式服务最"工程硬核"的部分：**prefill 池用 TP2 切分（每卡存一半的 KV 头），decode 池用 PP2 切分（每卡存一半的层）**——prefill 卡上的 KV 块布局和 decode 卡上需要的布局完全不同！传输时必须重新映射/重排（把 TP 切分的块重新组织成 PP 需要的层切分）。**"异构并行之间的数据重排"**是分布式推理的常见难题。
 
-### Unique Global Request ID
+KV cache 传输所需的优化因场景而异：单节点多 GPU、多节点多 GPU、或不同的 GPU 型号。为适应这种情况，TensorRT LLM 提供了一组环境变量供不同环境选择。详见以下章节[环境变量](#Environment-Variables)。
 
-The context and generation phases of one request must share a single request ID: the ctx↔gen KV-cache transfer is keyed by it, so a collision (two in-flight requests with the same ID) corrupts the transfer. This shared ID is carried on `DisaggregatedParams.disagg_request_id`.
+### 唯一全局请求 ID
 
-The disaggregated server generates this ID itself as a **snowflake** — a self-contained 64-bit positive integer that is unique without any cross-process coordination. The bit layout is:
+一个请求的上下文和生成阶段必须共享同一个请求 ID：ctx↔gen 的 KV cache 传输以它作为键，所以碰撞（两个在途请求 ID 相同）会破坏传输。这个共享 ID 携带在 `DisaggregatedParams.disagg_request_id` 上。
+
+分离式服务器自己生成这个 ID，采用 **snowflake** 格式——一个自包含的 64 位正整数，无需跨进程协调即可保证唯一。位布局：
 
 ```
 [ 0 (1 bit) | timestamp_ms (39 bits) | node_id (8 bits) | process_id (6 bits) | counter (10 bits) ]
 ```
 
-- `node_id` (0–255) identifies the node (defaults to a hash of the MAC address; overridable via `node_id` in the disaggregated config).
-- `process_id` (0–63) identifies the orchestrator process on that node. In a [coordinator + worker fleet](#coordinator-and-worker-fleet) each fleet worker receives a distinct value, so co-located workers never emit the same ID in the same millisecond. It is set from the `TRTLLM_DISAGG_WORKER_PROCESS_ID` environment variable (assigned automatically per worker by the launcher).
-- The `(node_id, process_id)` pair therefore makes the ID unique across all orchestrator processes without a shared counter or an extra network round trip — each worker mints its own IDs locally.
+- `node_id`（0–255）标识节点（默认取 MAC 地址的哈希；可在分离式配置中通过 `node_id` 覆盖）。
+- `process_id`（0–63）标识该节点上的编排进程。在 [coordinator + worker 集群](#coordinator-and-worker-fleet) 中，每个集群 worker 获得不同的值，因此同一节点上的 worker 不会在同一毫秒内生成相同的 ID。它由 `TRTLLM_DISAGG_WORKER_PROCESS_ID` 环境变量设置（launcher 自动为每个 worker 分配）。
+- `(node_id, process_id)` 组合因此使 ID 在所有编排进程间唯一，无需共享计数器或额外的网络往返——每个 worker 在本地铸造自己的 ID。
 
-Global disaggregated IDs occupy the range `[1 << 40, 2**63)`; worker-local and warm-up request IDs occupy the disjoint range `[0, 1 << 40)`, so the two never collide. If a client supplies its own positive `disagg_request_id`, that value is used verbatim and must be globally unique; when unset, the server mints a snowflake ID as above.
+> 💡 **AI Infra 视角**：**Snowflake ID 算法**是分布式系统生成全局唯一 ID 的经典方案（Twitter 发明）：时间戳 + 机器 ID + 序号 三段拼一个 64 位整数。**"无协调生成全局唯一 ID"**是分布式系统的基础设施问题——snowflake 比"连数据库取号"快得多（不需要网络往返），比"随机 UUID"更紧凑有序。面试分布式系统时这是必知概念。
 
-## Usage
+全局分离式 ID 占用 `[1 << 40, 2**63)` 区间；worker 本地和预热请求 ID 占用不相交的 `[0, 1 << 40)` 区间，两者永不碰撞。如果客户端自带正的 `disagg_request_id`，该值按原样使用，必须全局唯一；未设置时，服务器按上面的 snowflake 格式铸造 ID。
+
+## 用法
 
 ### Dynamo
 
-The first approach involves the use of [Dynamo](https://github.com/ai-dynamo/dynamo), a data center-scale inference server developed specifically for LLM workloads. Dynamo introduces several advanced features not present in the other methods, including decoupled pre- and post-processing workers, which are particularly beneficial under high concurrency conditions. The disaggregated LLM inference workflow with Dynamo is illustrated in Figure 7.
+第一种方法使用 [Dynamo](https://github.com/ai-dynamo/dynamo)，一个专为 LLM 工作负载开发的数据中心级推理服务器。Dynamo 引入了其他方法没有的几项高级特性，包括解耦的前处理和后处理 worker，在高并发条件下特别有用。使用 Dynamo 的分离式 LLM 推理工作流如图 7 所示。
 
 <div align="center">
 <figure>
   <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture4.png" width="800" height="auto">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 7. Dynamo integration with disaggregated service</em></sub></p>
+<p align="center"><sub><em>图 7. Dynamo 与分离式服务集成</em></sub></p>
 
-In the Dynamo workflow, requests are initially processed by pre- and post-processing workers, which then query a smart router to determine the optimal decode worker to route the requests to. Depending on the availability of KV cache blocks, the decoder worker may bypass the prefill stage or forward the request to the prefill worker. Once the prefill worker is done processing the prompt, the KV cache blocks can be sent from the prefill worker to the decoder worker, using the metadata referred to as ctx_params in the figure above.
+在 Dynamo 工作流中，请求首先由前/后处理 worker 处理，然后查询一个智能路由器，确定将请求路由到哪个最优的 decode worker。根据 KV cache 块的可用性，decoder worker 可能跳过 prefill 阶段，或将请求转发给 prefill worker。一旦 prefill worker 处理完 prompt，KV cache 块可以从 prefill worker 发送到 decoder worker，使用上图中称为 ctx_params 的元数据。
 
-Dynamo also includes built-in support for Kubernetes deployment, monitoring, and metrics collection. The development team is actively working on enabling dynamic instance scaling, further enhancing its suitability for production environments.
+> 💡 **AI Infra 视角**：Dynamo 的路由逻辑非常聪明——**"如果 KV cache 已经命中，decode worker 直接开干，跳过 prefill"**：这是 KV cache 前缀复用 + 分离式服务的组合拳（命中缓存的请求 = 免 prefill）。这也解释了为什么 Dynamo 要做"智能路由"：路由决策（去哪个 decode worker）要结合 KV cache 命中情况。
 
-For more information on how to use Dynamo with TensorRT-LLM, please refer to [this documentation](https://docs.nvidia.com/dynamo/backends/tensor-rt-llm).
+Dynamo 还内置支持 Kubernetes 部署、监控和指标收集。开发团队正在积极推进动态实例扩缩容，进一步增强其在生产环境中的适用性。
+
+关于如何将 Dynamo 与 TensorRT-LLM 一起使用，请参考[此文档](https://docs.nvidia.com/dynamo/backends/tensor-rt-llm)。
 
 ### trtllm-serve
 
-The second approach to evaluate disaggregated LLM inference with TensorRT LLM involves launching a separate OpenAI-compatible server per context and generation instance using `trtllm-serve`. An additional server, referred to as the "disaggregated" server, is also launched with `trtllm-serve` and acts as an orchestrator which receives client requests and dispatches them to the appropriate context and generation servers via OpenAI REST API. Figure 6 below illustrates the disaggregated serving workflow when using this approach. When a context instance is done generating the KV blocks associated with the prompt, it returns a response to the disaggregated server. This response includes the prompt tokens, the first generated token and metadata associated with the context request and context instance. This metadata is referred to as context parameters (`ctx_params` in Figure 6). These parameters are then used by the generation instances to establish communication with the context instance and retrieve the KV cache blocks associated with the request.
+评估 TensorRT LLM 分离式推理的第二种方法是用 `trtllm-serve` 为每个上下文和生成实例启动独立的 OpenAI 兼容服务器。另外还会用 `trtllm-serve` 启动一个"分离式（disaggregated）"服务器，作为编排器（orchestrator），接收客户端请求并通过 OpenAI REST API 分发给适当的上下文和生成服务器。图 6 展示了使用这种方法时的分离式服务工作流。当上下文实例完成与 prompt 关联的 KV 块生成后，它向分离式服务器返回一个响应。该响应包含 prompt token、第一个生成的 token 以及与上下文请求和上下文实例相关的元数据。这些元数据称为上下文参数（图 6 中的 `ctx_params`）。生成实例随后使用这些参数与上下文实例建立通信并取回与该请求关联的 KV cache 块。
 
 ```{eval-rst}
 .. include:: ../_includes/note_sections.rst
@@ -142,12 +173,17 @@ The second approach to evaluate disaggregated LLM inference with TensorRT LLM in
   <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog5_Picture3.png" width="800" height="auto">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 6. `trtllm-serve` integration with disaggregated service</em></sub></p>
+<p align="center"><sub><em>图 6. `trtllm-serve` 与分离式服务集成</em></sub></p>
 
+> 💡 **AI Infra 视角**：用 trtllm-serve 搭建分离式服务的结构图（3 层）：
+> ```
+> 客户端 → 分离式编排器(:8000) → context 服务器(:8001/:8002) ──KV cache 传输──→ generation 服务器(:8003)
+> ```
+> 编排器把请求标记为"context-only"发给 prefill 池、把后续请求标记为"generation-only"发给 decode 池；KV cache 传输是**服务器之间直接进行**的（不经过编排器）——编排器只管路由，不管数据搬运。**控制面和数据面分离**，这是分布式系统的经典架构原则。
 
-To run TRT-LLM in disaggregated mode, you must first launch context (prefill) and generation (decode) servers using `trtllm-serve`.
+要以分离模式运行 TRT-LLM，你必须先用 `trtllm-serve` 启动上下文（prefill）和生成（decode）服务器。
 
-We use the `cache_transceiver_config` configuration to set up disaggregated serving, which includes the following parameters:
+我们使用 `cache_transceiver_config` 配置来设置分离式服务，包含以下参数：
 
 ```yaml
 cache_transceiver_config:
@@ -155,41 +191,42 @@ cache_transceiver_config:
   max_tokens_in_buffer: <int>
 ```
 
-`backend` specifies the communication backend for transferring the kvCache, valid options include `DEFAULT`, `UCX`, `NIXL`, and `MPI`. The default backend is NIXL.
+`backend` 指定传输 kvCache 的通信后端，合法选项包括 `DEFAULT`、`UCX`、`NIXL` 和 `MPI`。默认后端是 NIXL。
 
-Note: NIXL supports multiple underlying backends configured via the `TRTLLM_NIXL_KVCACHE_BACKEND` environment variable:
-- `UCX` (default)
-- `LIBFABRIC` (available from v0.16.0)
+注意：NIXL 支持通过 `TRTLLM_NIXL_KVCACHE_BACKEND` 环境变量配置的多个底层后端：
+- `UCX`（默认）
+- `LIBFABRIC`（从 v0.16.0 起可用）
 
-`max_tokens_in_buffer` defines the buffer size for kvCache transfers, it is recommended to set this value greater than or equal to the maximum ISL (Input Sequence Length) of all requests for optimal performance.
+`max_tokens_in_buffer` 定义 kvCache 传输的缓冲区大小，建议将此值设置为大于或等于所有请求的最大 ISL（输入序列长度），以获得最佳性能。
 
-For example, you could launch two context servers and one generation server as follows:
+> 💡 **AI Infra 视角**：`max_tokens_in_buffer` 的直觉：传输缓冲区要能装下"一整条请求的 KV"（最大输入长度对应的 KV 量）——装不下就得把一条 KV 拆多次传，慢。**"缓冲要够大，一次搬完"**。这个参数和显存预算有关（缓冲占显存），调大要确认显存够。
+
+例如，你可以这样启动两个上下文服务器和一个生成服务器：
 
 ```
 
-# Generate context_config.yml
-# Overlap scheduler for context servers are disabled because it's not supported for disaggregated context servers yet
+# 生成 context_config.yml
+# 上下文服务器禁用重叠调度器，因为分离式上下文服务器尚不支持
 echo -e "disable_overlap_scheduler: True\ncache_transceiver_config:\n  backend: UCX\n  max_tokens_in_buffer: 2048" > context_config.yml
 
-# Start Context servers
+# 启动上下文服务器
 CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8001 --backend pytorch --config ./context_config.yml &> log_ctx_0 &
 CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8002 --backend pytorch --config ./context_config.yml &> log_ctx_1 &
 
-# Generate gen_config.yml
+# 生成 gen_config.yml
 echo -e "cache_transceiver_config:\n  backend: UCX\n  max_tokens_in_buffer: 2048" > gen_config.yml
 
-# Start Generation servers
+# 启动生成服务器
 CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8003 --backend pytorch --config ./gen_config.yml &> log_gen_0 &
 ```
-Once the context and generation servers are launched, you can launch the disaggregated
-server, which will accept requests from clients and do the orchestration between context
-and generation servers. The disaggregated server can be launched with:
+上下文和生成服务器启动后，你可以启动分离式
+服务器，它将接受来自客户端的请求，并在上下文和生成服务器之间做编排。分离式服务器可以这样启动：
 
 ```
 trtllm-serve disaggregated -c disagg_config.yaml
 ```
-where `disagg_config.yaml` contains information about the context and generation servers. For the current example,
-it would look like:
+其中 `disagg_config.yaml` 包含上下文和生成服务器的信息。对于当前示例，
+它看起来像这样：
 ```
 hostname: localhost
 port: 8000
@@ -205,14 +242,18 @@ generation_servers:
       - "localhost:8003"
 ```
 
-When routing requests to the context servers, the disaggregated server will mark the requests as "context-only" to skip the generation phase. Similarly,
-when routing requests to the generation servers, the disaggregated server will mark the requests as "generation-only" to skip the context phase.
+> 💡 **AI Infra 视角**：注意这个配置的比例：**2 个 context 实例 : 1 个 generation 实例**。为什么 context 要更多？因为 prefill 计算密度高（同样的 GPU 时间产出更多 token），处理得快；而 decode 慢（每 token 一步步来），一个 decode 实例能"接住"两个 prefill 实例的产出。**prefill:decode 的实例配比是分离式部署调优的核心参数**（需要按工作负载实验确定）。
 
-The config also accepts an optional field that tunes the HTTP listeners:
+将请求路由到上下文服务器时，分离式服务器会把请求标记为"context-only"以跳过生成阶段。同样，
+将请求路由到生成服务器时，分离式服务器会把请求标记为"generation-only"以跳过上下文阶段。
 
-- `server_keep_alive_timeout` (int, default `10`) — HTTP keep-alive timeout in seconds, applied to the client-facing listener and to the coordinator's listener when it runs in-process (see [Coordinator and Worker Fleet](#coordinator-and-worker-fleet)). Raise it (for example, `3600`) when clients hold large idle connection pools and hit `Connection reset by peer` on a reused connection: the server closing an idle connection first leaves the client with a half-closed socket that fails on the next request.
+配置还接受一个可选字段来调优 HTTP 监听器：
 
-Clients can then send requests to the disaggregated server at `localhost:8000`, which is an OpenAI-compatible endpoint. For example, you can send requests to the disaggregated server using curl:
+- `server_keep_alive_timeout`（int，默认 `10`）——HTTP keep-alive 超时（秒），应用于面向客户端的监听器，以及协调器在进程内运行时其监听器（见 [Coordinator 和 Worker 集群](#coordinator-and-worker-fleet)）。当客户端持有大型空闲连接池并遇到"已复用连接上 `Connection reset by peer`"时，把它调大（例如 `3600`）：服务器先关闭空闲连接会让客户端留下半关闭的 socket，下次请求时失败。
+
+> 💡 **AI Infra 视角**：`Connection reset by peer` 是生产环境最常见的坑之一：HTTP keep-alive 复用连接，服务器按超时先关掉空闲连接，客户端不知道还在用——下次请求打在死连接上。**长连接池场景要把 keep-alive 超时调到大于客户端空闲时间**。
+
+然后客户端可以向 `localhost:8000` 的分离式服务器发送请求，这是一个 OpenAI 兼容端点。例如，你可以用 curl 向分离式服务器发送请求：
 ```
 curl http://localhost:8000/v1/completions \
     -H "Content-Type: application/json" \
@@ -224,63 +265,69 @@ curl http://localhost:8000/v1/completions \
     }' -w "\n"
 ```
 
-#### Launching disaggregated servers on SLURM clusters
+#### 在 SLURM 集群上启动分离式服务器
 
-Please refer to [Disaggregated Inference Benchmark Scripts](../../../examples/disaggregated/slurm).
+请参考 [分离式推理基准脚本](../../../examples/disaggregated/slurm)。
 
-### Multiple Instances
+### 多实例
 
-To increase maximum concurrency without more GPU nodes, you can deploy multiple disaggregated server instances across different nodes, while each instance manages the same context/generation servers. This is helpful when one disaggregated server becomes a performance bottleneck or runs out of ephemeral ports.
+要增加最大并发而无需更多 GPU 节点，你可以在不同节点上部署多个分离式服务器实例，每个实例管理相同的上下文/生成服务器。当单个分离式服务器成为性能瓶颈或用尽临时端口时，这很有帮助。
 
-Example (two-node deployment):
+示例（两节点部署）：
 
-- **Node A**
-  - Context servers: `node-a:8001`
-  - Generation servers: `node-b:8002`
-  - Disaggregated orchestrator endpoint: `node-a:8000`
-- **Node B**
-  - Context servers: `node-a:8001`
-  - Generation servers: `node-b:8002`
-  - Disaggregated orchestrator endpoint: `node-b:8000`
-- **Client entrypoint**
-  - Send requests or use a load balancer forwarding to `node-a:8000` and `node-b:8000`
+- **节点 A**
+  - 上下文服务器：`node-a:8001`
+  - 生成服务器：`node-b:8002`
+  - 分离式编排器端点：`node-a:8000`
+- **节点 B**
+  - 上下文服务器：`node-a:8001`
+  - 生成服务器：`node-b:8002`
+  - 分离式编排器端点：`node-b:8000`
+- **客户端入口**
+  - 发送请求或用负载均衡器转发到 `node-a:8000` 和 `node-b:8000`
 
-### Coordinator and Worker Fleet
+> 💡 **AI Infra 视角**：多实例方案本质是**无状态编排器的水平扩展**——编排器不持有状态（KV 在各服务器上），所以可以多部署几个、负载均衡分发。**"无状态 → 可水平扩展"**是分布式系统设计的金律。
 
-A single disaggregated server process is itself a single-threaded orchestrator and can become a throughput bottleneck (it terminates every client connection, runs routing, and proxies the ctx→gen hop). To scale the orchestrator on one node without standing up multiple independent instances, `trtllm-serve disaggregated` can run a **fleet** of stateless disaggregated-server worker processes behind a shared **coordinator**.
+### Coordinator 和 Worker 集群
 
-The two roles split as follows:
+单个分离式服务器进程本身是单线程的编排器，可能成为吞吐瓶颈（它终止每个客户端连接、运行路由、并代理 ctx→gen 跳转）。为了在单节点上扩展编排器而不部署多个独立实例，`trtllm-serve disaggregated` 可以在共享的 **coordinator（协调器）** 后面运行一组**无状态**的分离式服务器 worker 进程。
 
-- **Coordinator** — a single process that owns all cluster state: the ctx/gen routers, worker readiness, and (for the KV-cache-aware router) the single ZMQ event-ingest endpoint. It exposes an internal coordination API (`/select`, `/finish`, `/cluster_info`, `/health`).
-- **Fleet workers** — `num_workers` stateless disaggregated servers that share the public port via `SO_REUSEPORT` (each worker is its own process binding the same port, so the kernel load-balances incoming connections across them by 4-tuple hash). Each holds a lightweight delegating client: it computes the routing key locally (e.g. block hashes) and delegates the placement decision to the coordinator over HTTP. Workers own no routing state, so routing stays globally consistent no matter which worker terminates a connection. Each worker also gets a distinct `process_id` for the [global request ID](#unique-global-request-id).
+> 💡 **AI Infra 视角**：单线程编排器为什么是瓶颈？它处理的是"每请求的每次转发"——TCP 连接处理、HTTP 解析、路由决策都是 CPU 活。流量大时单进程就饱和了（Python 的 GIL 更是雪上加霜）。解法：**协调器/worker 分离**——路由状态集中在协调器，多个 worker 进程分担连接。
 
-This is controlled by two fields in the disaggregated config:
+两个角色分工如下：
 
-- `num_workers` (int, default `1`) — number of disaggregated-server worker processes to run on the public port.
-- `disagg_coordinator_url` (str, optional) — URL of an already-running coordinator. When set, this process starts **no** coordinator and its fleet delegates to that external one.
+- **Coordinator（协调器）** — 单个进程，拥有所有集群状态：ctx/gen 路由器、worker 就绪状态，以及（对于 KV cache 感知路由器）唯一的 ZMQ 事件摄取端点。它暴露一个内部协调 API（`/select`、`/finish`、`/cluster_info`、`/health`）。
+- **集群 worker（Fleet workers）** — `num_workers` 个无状态分离式服务器，通过 `SO_REUSEPORT` 共享公共端口（每个 worker 是绑定同一端口的独立进程，内核按 4 元组哈希在它们之间负载均衡入站连接）。每个 worker 持有一个轻量级委托客户端：它在本地计算路由键（如块哈希），并通过 HTTP 将放置决策委托给协调器。Worker 不持有路由状态，因此无论哪个 worker 终止连接，路由始终保持全局一致。每个 worker 还会为[全局请求 ID](#unique-global-request-id) 获得不同的 `process_id`。
 
-The three resulting topologies:
+> 💡 **AI Infra 视角**：`SO_REUSEPORT` 是 Linux 的经典技巧：多个进程绑定同一端口，内核自动分发新连接——**零代码水平扩展 TCP 服务**。路由状态集中在协调器（"谁决定放哪"是全局一致性问题），连接处理分散到 workers（"谁来接客"是本地问题）。**有状态集中、无状态分散**是分布式系统架构的标准答案。
 
-| `num_workers` | `disagg_coordinator_url` | Behavior |
+这由分离式配置中的两个字段控制：
+
+- `num_workers`（int，默认 `1`）——在公共端口上运行的分离式服务器 worker 进程数。
+- `disagg_coordinator_url`（str，可选）——已运行的 coordinator 的 URL。设置后，本进程**不启动** coordinator，其 worker 集群委托给外部 coordinator。
+
+三种拓扑：
+
+| `num_workers` | `disagg_coordinator_url` | 行为 |
 |---------------|--------------------------|----------|
-| `1` | unset | Single self-contained server with an in-process coordinator (the default; unchanged from earlier examples). |
-| `> 1` | unset | An **implicit** coordinator starts in this process (on `port - 1`) and a fleet of `num_workers` delegating servers runs on the public port. |
-| any | set | **No** coordinator starts here; a fleet of `num_workers` delegating servers points at the external `disagg_coordinator_url`. |
+| `1` | 未设置 | 单个自包含服务器，进程内 coordinator（默认；与前面示例相同）。 |
+| `> 1` | 未设置 | 本进程启动一个**隐式** coordinator（在 `port - 1` 上），并在公共端口上运行 `num_workers` 个委托服务器。 |
+| 任意 | 已设置 | 本进程**不启动** coordinator；`num_workers` 个委托服务器指向外部 `disagg_coordinator_url`。 |
 
 ```{note}
-The fleet is most useful with a *stateful* router (`kv_cache_aware`, `conversation`) where placement must be globally consistent — that decision is delegated to the coordinator. With a *stateless* router (`round_robin`, `load_balancing`) each worker simply places locally and no coordinator round-trip occurs.
+worker 集群对*有状态*路由器（`kv_cache_aware`、`conversation`）最有用，因为放置决策必须全局一致——该决策被委托给 coordinator。使用*无状态*路由器（`round_robin`、`load_balancing`）时，每个 worker 直接在本地放置，不会发生 coordinator 往返。
 ```
 
-#### Example: implicit coordinator + 4-worker fleet
+#### 示例：隐式 coordinator + 4 worker 集群
 
-Extend the `disagg_config.yaml` from the [trtllm-serve](#trtllm-serve) example with `num_workers` and a router type:
+在 [trtllm-serve](#trtllm-serve) 示例的 `disagg_config.yaml` 中加上 `num_workers` 和路由器类型：
 
 ```yaml
 hostname: localhost
 port: 8000
 backend: pytorch
-# Run 4 stateless disaggregated-server workers on port 8000, with an implicit
-# coordinator started in-process on port 7999 (port - 1).
+# 在端口 8000 上运行 4 个无状态分离式服务器 worker，隐式
+# coordinator 在进程内启动于端口 7999（port - 1）。
 num_workers: 4
 context_servers:
   num_instances: 2
@@ -297,17 +344,17 @@ generation_servers:
     type: kv_cache_aware
 ```
 
-Launch it exactly as before — the coordinator and fleet are started for you:
+和之前一样启动——coordinator 和 worker 集群会自动为你启动：
 
 ```bash
 trtllm-serve disaggregated -c disagg_config.yaml
 ```
 
-Clients still send requests to the public endpoint (`localhost:8000`); the fleet transparently delegates routing to the coordinator.
+客户端仍然向公共端点（`localhost:8000`）发送请求；worker 集群透明地把路由委托给 coordinator。
 
-#### Example: external coordinator
+#### 示例：外部 coordinator
 
-To point a fleet at a coordinator already running elsewhere (for example, one shared across nodes), set `disagg_coordinator_url` and omit the coordinator from this process:
+要把 worker 集群指向已在别处运行的 coordinator（例如在节点间共享的一个），设置 `disagg_coordinator_url` 并省略本进程中的 coordinator：
 
 ```yaml
 hostname: localhost
@@ -331,106 +378,109 @@ generation_servers:
 ```
 
 ```{note}
-A fleet worker fails fast if its coordinator is unreachable: on startup it probes the coordinator's `/cluster_info` with bounded retry (up to `--server_start_timeout` seconds) and exits with an error rather than coming up and returning `Cluster is not ready` for every request.
+集群 worker 在 coordinator 不可达时会快速失败：启动时它用有界重试（最多 `--server_start_timeout` 秒）探测 coordinator 的 `/cluster_info`，如果失败就以错误退出，而不是启动后对每个请求返回 `Cluster is not ready`。
 ```
 
-## Environment Variables
+## 环境变量
 
-TRT-LLM uses some environment variables to control the behavior of disaggregated service.
+TRT-LLM 使用一些环境变量控制分离式服务的行为。
 
-* `TRTLLM_NIXL_KVCACHE_BACKEND`: When using NIXL as the cache transceiver backend, this variable specifies the underlying communication backend for NIXL. Valid options are:
-  - `UCX` (default)
-  - `LIBFABRIC` (available from v0.16.0)
-  - If an unsupported value is specified, NIXL will automatically fall back to UCX
+* `TRTLLM_NIXL_KVCACHE_BACKEND`：使用 NIXL 作为 cache transceiver 后端时，此变量指定 NIXL 的底层通信后端。合法选项：
+  - `UCX`（默认）
+  - `LIBFABRIC`（从 v0.16.0 起可用）
+  - 如果指定了不支持的值，NIXL 会自动回退到 UCX
 
-* `TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP`: If set to `1`, generationExecutor will not overlap KV cache transfer with model inference. The default value is `0`.
+* `TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP`：设为 `1` 时，generationExecutor 不会将 KV cache 传输与模型推理重叠。默认值为 `0`。
 
-* `TRTLLM_ENABLE_KVCACHE_RECEIVE_PARALLEL`:  When the generation rank receives KV cache from multiple context ranks within a single context instance, it will receive KV cache from each rank sequentially. If set to `1`, the generation rank will receive KV cache from each rank within one context instance in parallel. The default value is `0`.
+* `TRTLLM_ENABLE_KVCACHE_RECEIVE_PARALLEL`：当生成 rank 从单个上下文实例中的多个上下文 rank 接收 KV cache 时，它会依次从每个 rank 接收 KV cache。设为 `1` 时，生成 rank 并行接收一个上下文实例内各 rank 的 KV cache。默认值为 `0`。
 
-* `TRTLLM_REQUEST_KV_CACHE_CONCURRENT`: If set to `1`, generationExecutor prepares independent resources for each context executor to receive KV cache, requests whose KV cache are received from different context executors will be processed concurrently. If set to `0`, the generation executor will reuse the same resource to process KV cache transfer for each request sequentially, reducing the resources used by KV cache transmission and thereby lowering the risk of running out of memory. The default value is `0`.
+* `TRTLLM_REQUEST_KV_CACHE_CONCURRENT`：设为 `1` 时，generationExecutor 为每个上下文 executor 准备独立资源来接收 KV cache，从不同上下文 executor 收到 KV cache 的请求会被并发处理。设为 `0` 时，生成 executor 复用同一资源串行处理每个请求的 KV cache 传输，减少 KV cache 传输使用的资源，从而降低内存耗尽的风险。默认值为 `0`。
 
-* `TRTLLM_TRY_ZCOPY_FOR_KVCACHE_TRANSFER`: TRT-LLM typically copies non-contiguous data into a temporary buffer before sending KV cache. If set to `1`, TRT-LLM will attempt to directly transmit each KV cache block, eliminating extra copies. The default value is `0`.
+* `TRTLLM_TRY_ZCOPY_FOR_KVCACHE_TRANSFER`：TRT-LLM 通常在发送 KV cache 前把非连续数据复制到临时缓冲区。设为 `1` 时，TRT-LLM 尝试直接传输每个 KV cache 块，消除额外复制。默认值为 `0`。
 
-* `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE`: By default, TRT-LLM uses a `stream-ordered memory allocator` to allocate temporary buffers. If this environment variable is set to #Size, TRT-LLM will use `cudaMalloc` to allocate buffer of size #Size for KV cache transmission. The default value is `512MB`. Users can set `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE=1GB` to allocate a 1 GB buffer with `cudaMalloc` for KV cache transmission.
+> 💡 **AI Infra 视角**：zcopy（零拷贝）是高性能传输的核心追求：**每次拷贝都花时间、占带宽**。KV cache 是分页的（块散落各处），直接传每块（zcopy）省掉"先拼成连续 buffer 再传"的拷贝，但要小心每块传输的启动开销。**"拷贝 vs 启动开销"的权衡**是 RDMA 编程的经典问题。
 
-* `TRTLLM_KVCACHE_TRANSFER_USE_ASYNC_BUFFER`: If set to `1`, TRT-LLM will use `cudaMallocAsync` to allocate buffers for KV cache transmission. The default value is `0`. This environment variable only takes effect when `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE` is greater than 0.
+* `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE`：默认情况下，TRT-LLM 使用 `stream-ordered memory allocator` 分配临时缓冲区。如果此环境变量设为 #Size，TRT-LLM 将使用 `cudaMalloc` 分配大小为 #Size 的缓冲区用于 KV cache 传输。默认值为 `512MB`。用户可以设置 `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE=1GB` 用 `cudaMalloc` 分配 1 GB 缓冲区用于 KV cache 传输。
 
-* `TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM`: The maximum number of concurrent KV cache sends. The default value is `1`. This environment variable only takes effect when `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE` is greater than 0.
+* `TRTLLM_KVCACHE_TRANSFER_USE_ASYNC_BUFFER`：设为 `1` 时，TRT-LLM 使用 `cudaMallocAsync` 分配 KV cache 传输缓冲区。默认值为 `0`。此环境变量仅在 `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE` 大于 0 时生效。
 
-There are some other useful environment variables that may help when encountering failures or performance issues.
+* `TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM`：最大并发 KV cache 发送数。默认值为 `1`。此环境变量仅在 `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE` 大于 0 时生效。
 
-* `NCCL_GRAPH_MIXING_SUPPORT`: TensorRT-LLM now initializes common NCCL communicators with graph
-  mixing support off by default to reduce launch overhead for CUDA graph-captured NCCL operations.
-  This assumes the communicator is not used by parallel graph launches or by uncaptured NCCL calls
-  while a graph launch is outstanding. Set `NCCL_GRAPH_MIXING_SUPPORT=1` to restore NCCL's default
-  graph mixing behavior if your workload needs it. For more details, see the
-  [NCCL_GRAPH_MIXING_SUPPORT documentation](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html#nccl-graph-mixing-support).
+还有一些其他有用的环境变量，可能在遇到故障或性能问题时有所帮助。
 
-* `UCX_MAX_RNDV_RAILS`: With the default value 2, UCX attempts to use two InfiniBand (IB) NIC devices per GPU for Rendezvous (RNDV) transfers. When both the context and generation instances enable tensor- and expert-parallel (TEP), multiple TP ranks may transfer KV cache concurrently. Because each TP rank can use up to two NIC devices, some NIC devices can be shared across GPUs, causing contention and reduced throughput. Setting UCX_MAX_RNDV_RAILS=1 can reduce contention in this case.
+* `NCCL_GRAPH_MIXING_SUPPORT`：TensorRT-LLM 现在默认关闭公共 NCCL communicator 的 graph mixing 支持，以减少 CUDA graph 捕获的 NCCL 操作的启动开销。这假设 communicator 不会被并行 graph 启动或未捕获的 NCCL 调用在 graph 启动未完成时使用。如果你的工作负载需要，设置 `NCCL_GRAPH_MIXING_SUPPORT=1` 恢复 NCCL 默认的 graph mixing 行为。更多细节见 [NCCL_GRAPH_MIXING_SUPPORT 文档](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html#nccl-graph-mixing-support)。
 
-## Troubleshooting and FAQ
+> 💡 **AI Infra 视角**：这个环境变量展示了 CUDA Graph 与 NCCL 的**兼容性冲突**：CUDA Graph 要求"同样的 kernel 序列"可重复捕获执行，而 NCCL 的 graph mixing 允许在 graph 执行中混入新操作——两者理念冲突，TRT-LLM 默认关掉 mixing 以省启动开销。**"优化 A 与优化 B 互斥时的取舍"**——这种兼容性矩阵知识是排查疑难杂症时最值钱的。
 
-### General FAQs
+* `UCX_MAX_RNDV_RAILS`：默认值 2 时，UCX 尝试为每次 Rendezvous（RNDV）传输使用每 GPU 两个 InfiniBand（IB）网卡设备。当上下文和生成实例都启用张量和专家并行（TEP）时，多个 TP rank 可能并发传输 KV cache。由于每个 TP rank 最多使用两个网卡设备，某些网卡设备可能被多个 GPU 共享，导致争用和吞吐下降。此时设置 `UCX_MAX_RNDV_RAILS=1` 可以减少争用。
 
-*Q. What are the limitations of disaggregated serving in TRT-LLM?*
+> 💡 **AI Infra 视角**："rails"是 IB 网络的术语——并行网卡通道。默认用 2 条通道快，但多 rank 抢网卡时反而互相干扰（都想要同 2 条）——降成 1 条减少争抢。**"并行度越高越好"的例外：共享资源上的并行会互相拖累**。
 
-A. Currently, only decoder-only models and beam width of 1 are supported. Also the KV cache at each layer of the model is required to be homogeneous, with the same data type and the same number of attention heads.
+## 故障排查与 FAQ
 
-*Q. When using the TRT backend, is the engine used for disaggregated serving different from other engines?*
+### 常见 FAQ
 
-A. No. There are no special requirements for the arguments to build engine.
+*问：TRT-LLM 中分离式服务的限制是什么？*
 
-*Q. When using the TRT backend, do the engines used by the context and generation instances need to be the same?*
+答：目前只支持 decoder-only 模型和 beam width 为 1。此外，模型每层的 KV cache 必须是同质的（homogeneous），具有相同的数据类型和相同的 attention 头数。
 
-A. No. The engines used by context and generation instances can be different, and their parallelism can be heterogeneous, i.e., TP,PP can be different, and TRT-LLM will handle the heterogeneity of KV cache.
+*问：使用 TRT 后端时，用于分离式服务的引擎与其他引擎有什么不同吗？*
 
-*Q. Can a TRT-LLM server instance handle both context-only requests and generation-only requests?*
+答：没有。构建引擎的参数没有特殊要求。
 
-A. Yes, but it's not recommended. TRT-LLM does not implement optimal scheduling for the case where the instance handles mixed context-only requests and generation-only requests. It's better to run context-only requests and generation-only requests on sets of servers.
+*问：使用 TRT 后端时，上下文和生成实例使用的引擎需要相同吗？*
 
-*Q. Does disaggregated serving in TRT-LLM support multi-gpu and multi-node?*
+答：不需要。上下文和生成实例使用的引擎可以不同，它们的并行度可以是异构的，即 TP、PP 可以不同，TRT-LLM 会处理 KV cache 的异构性。
 
-A. Yes, it's recommended that different server instances use different GPUs. We support running context and generation servers on the same node or different nodes. The `CUDA_VISIBLE_DEVICES` env variable can be used to control which GPUs are used by each instance.
+> 💡 **AI Infra 视角**：这条 FAQ 价值很高：**prefill 池和 decode 池可以独立选择并行配置**（prefill 用大 TP 求快、decode 用不同配置），引擎不必相同——这正是分离式服务"独立优化"的体现。KV cache 布局转换（上文讲过）就是为异构并行准备的。
 
-### Debugging FAQs
+*问：TRT-LLM 服务器实例能同时处理 context-only 和 generation-only 请求吗？*
 
-*Q. Why does NIXL fail to use LIBFABRIC backend even when `TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC` is set?*
+答：可以，但不推荐。TRT-LLM 没有为实例同时处理混合的 context-only 和 generation-only 请求实现最优调度。最好在独立的服务器组上运行 context-only 和 generation-only 请求。
 
-A: The TensorRT-LLM container doesn't include the NIXL LIBFABRIC plugin by default. You need to either:
+*问：TRT-LLM 的分离式服务支持多 GPU 和多节点吗？*
 
-1. **Rebuild NIXL**: Install libfabric and hwloc first, then rebuild NIXL following the installation instructions above
-2. **Use a pre-compiled plugin**: If you have a compatible `libplugin_LIBFABRIC.so`, set `NIXL_PLUGINS_DIR` to point to its directory
+答：支持，建议不同的服务器实例使用不同的 GPU。我们支持在同一节点或不同节点上运行上下文和生成服务器。`CUDA_VISIBLE_DEVICES` 环境变量可用于控制每个实例使用哪些 GPU。
 
-Please see the [disaggregated serving examples documentation](../../../examples/disaggregated/README.md) for detailed installation and configuration instructions.
+### 调试 FAQ
 
-*Q. How to handle error `Disaggregated serving is not enabled, please check the configuration?`*
+*问：即使设置了 `TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC`，NIXL 为什么还是无法使用 LIBFABRIC 后端？*
 
-A. please set `backendType` of `CacheTransceiverConfig`.
+答：TensorRT-LLM 容器默认不包含 NIXL LIBFABRIC 插件。你需要：
+
+1. **重新构建 NIXL**：先安装 libfabric 和 hwloc，然后按上面的安装说明重新构建 NIXL
+2. **使用预编译插件**：如果你有兼容的 `libplugin_LIBFABRIC.so`，设置 `NIXL_PLUGINS_DIR` 指向其目录
+
+详细的安装和配置说明请参阅[分离式服务示例文档](../../../examples/disaggregated/README.md)。
+
+*问：如何处理错误 `Disaggregated serving is not enabled, please check the configuration?`*
+
+答：请设置 `CacheTransceiverConfig` 的 `backendType`。
 ```cpp
 ExecutorConfig executorConfig{...};
 
 executorConfig.setCacheTransceiverConfig(texec::CacheTransceiverConfig(BackendType::DEFAULT));
 ```
-*Q. Does TRT-LLM support using GPU direct RDMA for inter-node KV Cache transfer?*
+*问：TRT-LLM 支持节点间 KV Cache 传输使用 GPU direct RDMA 吗？*
 
-A. Yes, TRT-LLM supports using GPU direct RDMA for inter-node KV cache transfer.
+答：支持，TRT-LLM 支持节点间 KV cache 传输使用 GPU direct RDMA。
 
-*Q. How do I debug a suspected hang from overlapping NCCL graph operations?*
+*问：如何调试疑似与重叠 NCCL graph 操作相关的挂起？*
 
-A. TensorRT-LLM turns graph mixing support off by default for common NCCL communicators. To check if
-a hang might be related to NCCL graph mixing support, set `NCCL_GRAPH_MIXING_SUPPORT=1` to restore
-NCCL's default graph mixing behavior.
+答：TensorRT-LLM 默认关闭公共 NCCL communicator 的 graph mixing 支持。要检查挂起是否与 NCCL graph mixing 支持有关，设置 `NCCL_GRAPH_MIXING_SUPPORT=1` 恢复 NCCL 默认的 graph mixing 行为。
 
-*Q. What causes the substantial bandwidth fluctuations in kvCache transfers, especially during the first few requests following service initialization?*
+*问：什么导致 kvCache 传输的带宽大幅波动，尤其是服务初始化后的前几个请求？*
 
-A. The communication for kvCache transfer between executors are established dynamically. The connection establishment process incurs significant overhead, which explains the apparently lower kvCache transfer bandwidth observed during the initial requests after service startup. This lower bandwidth reflects the inclusion of connection establishment overhead. When conducting benchmarks, it is recommended to perform a warm-up phase to ensure accurate performance measurements.
+答：executor 之间用于 kvCache 传输的通信是动态建立的。连接建立过程有显著开销，这解释了服务启动后最初几个请求观察到的 kvCache 传输带宽明显较低。这个较低带宽反映了连接建立开销的计入。进行基准测试时，建议执行预热阶段（warm-up）以确保性能测量准确。
 
-*Q. When my servers are running on different NVLink domains, some servers hang or have a lower performance. How to fix that?*
+> 💡 **AI Infra 视角**：**"跑基准必须先预热"**——连接建立、CUDA 图捕获、内存池分配都发生在启动初期，前几个请求的耗时不能代表稳态性能。所有基准测试的通用准则：先跑几轮热身，再取稳定段的数据。
 
-A. NVLink domain can be found with `nvidia-smi -q` in the `Fabric.ClusterUUID` field. A few UCX environment variables can be adjusted when your servers have different NVLink domains:
+*问：当我的服务器运行在不同的 NVLink 域时，一些服务器挂起或性能较低。如何修复？*
 
-* `UCX_CUDA_IPC_ENABLE_MNNVL`: Set to `n`. This also can reduce UCX timeout error messages like `UCX  ERROR   cuMemImportFromShareableHandle failed: invalid resource handle`, although these errors don't necessarily cause your trtllm-serve to fail.
+答：NVLink 域可以用 `nvidia-smi -q` 在 `Fabric.ClusterUUID` 字段中找到。当你的服务器位于不同的 NVLink 域时，可以调整几个 UCX 环境变量：
 
-* `UCX_NET_DEVICES`: Check if this is set correctly, or unset this variable to allow UCX to use all possible devices.
+* `UCX_CUDA_IPC_ENABLE_MNNVL`：设为 `n`。这也可以减少类似 `UCX  ERROR   cuMemImportFromShareableHandle failed: invalid resource handle` 的 UCX 超时错误消息，虽然这些错误不一定导致你的 trtllm-serve 失败。
 
-* `UCX_RNDV_SCHEME`: Set to `get_zcopy` or `put_zcopy` on GB200 for better performance. The default value is `auto`.
+* `UCX_NET_DEVICES`：检查此变量是否设置正确，或取消设置让 UCX 使用所有可用设备。
+
+* `UCX_RNDV_SCHEME`：在 GB200 上设置为 `get_zcopy` 或 `put_zcopy` 以获得更好性能。默认值为 `auto`。

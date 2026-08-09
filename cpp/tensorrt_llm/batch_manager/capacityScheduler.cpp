@@ -28,6 +28,32 @@
 #include <cstdlib>
 #include <iostream>
 
+// ============================================================================
+// 【中文讲解 · 容量调度器 CapacityScheduler】（本文件为学习用途添加，英文原注释保留）
+//
+// 对应文档：docs/source/torch/scheduler.md（PyTorch 后端调度器）、
+//           docs/source/features/paged-attention-ifb-scheduler.md（调度可视化）
+//
+// 职责：决定"哪些请求能进入这一步的 batch"。这是推理引擎调度链路的第一步
+// （第二步是 MicroBatchScheduler，见 microBatchScheduler.cpp）。
+//
+// 核心问题：KV cache 显存有限，请求来了必须判断"装得下吗"。
+// 装得下 → 调度（scheduling）；装不下 → 排队或暂停（pausing）。
+//
+// 本文件实现了四种调度策略（策略与机制分离，方便按需选择）：
+//   1. MaxRequestsScheduler      —— 只看请求数量上限，不看显存（最简）
+//   2. StaticBatchScheduler      —— 固定 batch，每步只调度固定数量的请求
+//   3. GuaranteedNoEvictScheduler—— "保证不驱逐"：一旦调度就保证跑到完成，
+//                                    新请求必须能预留"跑到结束所需的所有 KV 块"
+//   4. MaxUtilizationScheduler   —— "最大利用率"：优先让 GPU 吃满，
+//                                    必要时可以驱逐（evict）低优先级请求
+//
+// 调度策略的选择会直接影响两个指标：
+//   - 吞吐：MaxUtilization 通常最高（GPU 永远不闲着）
+//   - 公平性/稳定性：GuaranteedNoEvict 最稳（请求不会被中途踢掉）
+// 生产场景常按 SLO 需求选型：要稳定选 NoEvict，要极致吞吐选 MaxUtilization。
+// ============================================================================
+
 namespace tensorrt_llm::batch_manager
 {
 using kv_cache_manager::VecUniqueTokens;
@@ -215,6 +241,11 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::operator()(
 }
 
 template <bool StaticBatchScheduling>
+// 【中文讲解】"保证不驱逐"调度：已调度的请求必须能预留"跑到完成所需的所有 KV 块"
+// （getRemainingBlocksToCompletion），所以 GPU 宁可空着也不中途踢请求——
+// 换来稳定性和可预测的延迟，牺牲一点吞吐。对应 Python 版
+// GuaranteedNoEvictScheduler（tensorrt_llm/_torch/pyexecutor/scheduler.py），
+// 也是 trtllm-bench 输出里 "Scheduling Policy: Guaranteed No Evict" 的实现。
 std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
     kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
     OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager,

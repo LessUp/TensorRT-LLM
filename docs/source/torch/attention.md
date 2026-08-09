@@ -1,100 +1,105 @@
+<!--
+  本文档为 TensorRT-LLM 官方 PyTorch Backend Attention 文档的中文翻译版（AI 翻译，翻译日期 2026-08-07）。
+  英文原文可从 git 历史恢复：git checkout HEAD -- docs/source/torch/attention.md
+-->
+
 (attention)=
 
-# Attention
+# 注意力（Attention）
 
-This document details the implementation of multi-head attention (MHA),
-multi-query attention (MQA), and group-query attention (GQA) for autoregressive
-models in TensorRT-LLM's PyTorch backend. As a quick reminder, multi-head attention
-involves a sequence of batched matrix multiplications, a softmax operation, and another batched matrix multiplication,
-as described in the [Attention Is All You Need](https://arxiv.org/abs/1706.03762) paper.
-[Multi-query Attention (MQA)](https://arxiv.org/abs/1911.02150) and [Group-query Attention (GQA)](https://arxiv.org/abs/2307.09288) are
-variants of MHA that use fewer KV heads than the number of query heads.
-TensorRT LLM provides several implementations using different backends in `tensorrt_llm/_torch/attention_backend/`.
-The following sections explain how to use these implementations and provide a brief guide on implementing new backends.
+本文档详细说明 TensorRT-LLM PyTorch 后端中自回归模型的多头注意力（MHA）、
+多查询注意力（MQA）和分组查询注意力（GQA）的实现。快速回顾：多头注意力
+包含一系列批处理矩阵乘法、一次 softmax 运算和又一次批处理矩阵乘法，
+如 [Attention Is All You Need](https://arxiv.org/abs/1706.03762) 论文所述。
+[多查询注意力（MQA）](https://arxiv.org/abs/1911.02150) 和 [分组查询注意力（GQA）](https://arxiv.org/abs/2307.09288) 是
+MHA 的变体，使用的 KV 头数少于查询头数。
+TensorRT LLM 在 `tensorrt_llm/_torch/attention_backend/` 中提供了使用不同后端的多种实现。
+以下章节说明如何使用这些实现，并提供实现新后端的简要指南。
 
-## Attention Backends
+> 💡 **AI Infra 视角**：本篇与 [features/attention.md](../features/attention.md) 内容基本一致（后者多了 TrtllmAttention 特性的详细介绍），此处只保留后端对比和实现指南，详细讲解请看那篇。**为什么有两份？** features/ 面向使用者（选后端、配参数），torch/ 面向开发者（写新后端）——**同一主题按读者分层**是优秀文档体系的做法。
 
+## 注意力后端
 
-There are currently three available attention backends: the vanilla backend, the TRT-LLM backend, and the Flashinfer backend.
-You can specify the desired attention backend using `PyTorchConfig.attn_backend`. For instance, to utilize the Flashinfer backend, you can pass `attn_backend="flashinfer"` to the `LLM` constructor as follows: `LLM(attn_backend="flashinfer")`. This will enable the use of the Flashinfer backend for your model.
+目前有三个可用的注意力后端：vanilla 后端、TRT-LLM 后端和 Flashinfer 后端。
+你可以使用 `PyTorchConfig.attn_backend` 指定想要的注意力后端。例如，要使用 Flashinfer 后端，可以给 `LLM` 构造函数传 `attn_backend="flashinfer"`：`LLM(attn_backend="flashinfer")`。这将为你的模型启用 Flashinfer 后端。
 
-The vanilla backend, `VanillaAttention`, is a reference implementation designed primarily for inflight batching and linear KV cache support. While it serves as a useful baseline, it is not recommended for production use due to its limited optimizations.
+vanilla 后端 `VanillaAttention` 是一个参考实现，主要设计用于飞行中批处理和线性 KV cache 支持。虽然它可以作为有用的基线，但由于优化有限，不建议在生产中使用。
 
-In contrast, the Flashinfer backend, `FlashInferAttention`, is performance-optimized and supports both inflight batching and paged KV cache. It also includes the following advanced features:
+相比之下，Flashinfer 后端 `FlashInferAttention` 经过性能优化，支持飞行中批处理和分页 KV cache。它还包括以下高级特性：
 
-1. **FP8 Quantization**: This feature enables the quantization of inputs and KV cache into FP8 format, significantly reducing memory usage and improving computational throughput.
-2. **RoPE Fusion**: By integrating rotary position embedding (RoPE) directly into the attention computation, this feature enhances efficiency and reduces overhead.
+1. **FP8 量化**：此特性支持将输入和 KV cache 量化为 FP8 格式，显著降低显存占用并提高计算吞吐。
+2. **RoPE 融合**：通过将旋转位置编码（RoPE）直接集成到注意力计算中，提高效率并降低开销。
 
-The TRT-LLM backend, `TrtllmAttention`, serves as the default backend and supports all the features available in the Flashinfer backend while being further optimized for enhanced performance. It is the recommended choice for production environments. Additionally, it offers the following advanced features:
+TRT-LLM 后端 `TrtllmAttention` 是默认后端，支持 Flashinfer 后端的所有特性，并进一步优化以获得更好的性能。它是生产环境的推荐选择。此外，它还提供以下高级特性：
 
-1. **Fused QKV Input**: It can accept a single QKV tensor as input, which is more efficient compared to using separate Q, K, and V tensors.
-2. **FP8 Output**: It supports outputting the attention result in FP8 format, fusing quantization into the attention computation process.
+1. **融合 QKV 输入**：可以接受单个 QKV 张量作为输入，比使用单独的 Q、K、V 张量更高效。
+2. **FP8 输出**：支持以 FP8 格式输出注意力结果，将量化融合到注意力计算过程中。
 
-## Implement a New Attention Backend
+## 实现一个新的注意力后端
 
-You can implement a new attention backend to integrate other attention libraries.
-An attention backend consists of an `AttentionBackend` class and an `AttentionMetadata` class.
-There are three stages in the PyTorch that involve the attention backend:
+你可以实现一个新的注意力后端来集成其他注意力库。
+一个注意力后端由 `AttentionBackend` 类和 `AttentionMetadata` 类组成。
+PyTorch 有三个涉及注意力后端的阶段：
 
-1. Model construction: During the model's `__init__`, call `AttentionBackend.__init__` to create an attention backend for each layer.
-2. Metadata preparation: Before each forward step of the model:
-   1. If the metadata is uninitialized, call `AttentionMetadata.__init__` to create the attention metadata.
-   2. If using CUDA graphs, call `AttentionMetadata.create_cuda_graph_metadata` to convert the metadata to CUDA graph metadata, which pre-allocates all tensors and can be used to capture CUDA graphs. Do not re-allocate any tensors stored inside `AttentionMetadata` after the initial warmup run when using CUDA graphs.
-   3. To prepare parameters of the input and KV cache, call `AttentionMetadata.prepare` to convert from existing metadata and KV cache manager.
-3. Single step forward: During the forward pass of each attention layer, call `AttentionBackend.forward` to perform the attention operation. The `AttentionMetadata` will be provided as a forward argument.
+1. 模型构建：在模型的 `__init__` 中，调用 `AttentionBackend.__init__` 为每一层创建一个注意力后端。
+2. 元数据准备：在模型每次前向步骤之前：
+   1. 如果元数据未初始化，调用 `AttentionMetadata.__init__` 创建注意力元数据。
+   2. 如果使用 CUDA graphs，调用 `AttentionMetadata.create_cuda_graph_metadata` 将元数据转换为 CUDA graph 元数据，它会预分配所有张量，可用于捕获 CUDA graphs。使用 CUDA graphs 时，在初始预热运行后不要重新分配 `AttentionMetadata` 中存储的任何张量。
+   3. 为准备输入和 KV cache 的参数，调用 `AttentionMetadata.prepare`，从现有元数据和 KV cache 管理器转换。
+3. 单步前向：在每层注意力的前向过程中，调用 `AttentionBackend.forward` 执行注意力操作。`AttentionMetadata` 将作为前向参数提供。
 
-### Implement `AttentionMetadata`
+### 实现 `AttentionMetadata`
 
-The `AttentionMetadata` class stores metadata from the batched input and KV cache for the attention backend.
-It contains the following predefined fields:
+`AttentionMetadata` 类存储来自批处理输入和 KV cache 的元数据，供注意力后端使用。
+它包含以下预定义字段：
 
-| Field | Type | Description |
+| 字段 | 类型 | 描述 |
 | ----- | ---- | ----------- |
-| max_num_requests | int | The max number of requests in a single batch. |
-| num_contexts | int | The number of context-phase sequences in the batch. |
-| num_generations | int | The number of generation-phase sequences in the batch. |
-| max_num_tokens | int | The max number of tokens in all requests in a single batch. |
-| num_tokens | int | Number of tokens in the batch. |
-| num_ctx_tokens | int | Number of tokens in sequences in the context phase. |
-| kv_cache_manager | KVCacheManager | The KV cache manager. |
-| is_cuda_graph | bool | Whether CUDA graph is enabled. |
-| seq_lens | Tensor | The length of each sequence in the batch. The shape is (batch_size), and located on CPU memory. |
-| seq_lens_cuda | Tensor | A copy of `seq_lens` store on the GPU. |
-| context_lens | Tensor | The length of each context-phase sequence in the batch. The shape is (`num_contexts`). |
-| position_ids | Optional[Tensor] | The position of each token in each sequence. May be None if positional embedding is applied outside of the backend. |
-| request_ids | List[int] | The request ID of each sequence in the batch. |
-| prompt_lens | List[int] | The prompt length of each sequence in the batch. |
-| kv_cache_params | KVCacheParams | The parameters for the KV cache. |
+| max_num_requests | int | 单个 batch 中的最大请求数。 |
+| num_contexts | int | batch 中上下文阶段序列的数量。 |
+| num_generations | int | batch 中生成阶段序列的数量。 |
+| max_num_tokens | int | 单个 batch 中所有请求的最大 token 数。 |
+| num_tokens | int | batch 中的 token 数。 |
+| num_ctx_tokens | int | 上下文阶段序列中的 token 数。 |
+| kv_cache_manager | KVCacheManager | KV cache 管理器。 |
+| is_cuda_graph | bool | 是否启用 CUDA graph。 |
+| seq_lens | Tensor | batch 中每个序列的长度。形状为 (batch_size)，位于 CPU 内存。 |
+| seq_lens_cuda | Tensor | 存储在 GPU 上的 `seq_lens` 副本。 |
+| context_lens | Tensor | batch 中每个上下文阶段序列的长度。形状为 (`num_contexts`)。 |
+| position_ids | Optional[Tensor] | 每个序列中每个 token 的位置。如果在后端外部应用位置嵌入，可能为 None。 |
+| request_ids | List[int] | batch 中每个序列的请求 ID。 |
+| prompt_lens | List[int] | batch 中每个序列的 prompt 长度。 |
+| kv_cache_params | KVCacheParams | KV cache 的参数。 |
 
-During `AttentionMetadata.__init__`, you can initialize additional fields for the new attention metadata.
-For example, the Flashinfer metadata initializes `decode_wrapper` here.
-During `AttentionMetadata.prepare`, the runtime will fill all predefined fields, and you can fill your customized fields according to these predefined fields.
-For example, the Flashinfer metadata fills `qo_indptr` by combining `context_lens` and `num_generations` here.
+在 `AttentionMetadata.__init__` 期间，你可以为新注意力元数据初始化额外字段。
+例如，Flashinfer 元数据在这里初始化 `decode_wrapper`。
+在 `AttentionMetadata.prepare` 期间，运行时将填充所有预定义字段，你可以根据这些预定义字段填充自定义字段。
+例如，Flashinfer 元数据在这里通过组合 `context_lens` 和 `num_generations` 填充 `qo_indptr`。
 
-### Implement `AttentionBackend`
+### 实现 `AttentionBackend`
 
-The `AttentionBackend` delegates the attention operation to the backend implementation.
+`AttentionBackend` 将注意力操作委托给后端实现。
 
-Its `__init__` accepts the following arguments:
+其 `__init__` 接受以下参数：
 
-| Field | Type | Description |
+| 字段 | 类型 | 描述 |
 | ----- | ---- | ----------- |
-| layer_idx | int | The index of the attention layer in the model. |
-| num_heads | int | The number of query heads. |
-| head_dim | int | The size of each attention head `(hidden_size // num_heads)`. |
-| num_kv_heads | Optional[int] | The number of KV heads. Defaults to num_heads if None. |
-| quant_config | QuantConfig | Optional quantization configuration. If None, no quantization is applied. |
-| pos_embd_params | PositionalEmbeddingParams | Optional parameters defining how positional embedding should be applied. If None, positional embedding should be applied by the model before calling the backend. Otherwise, the backend is in-charge of applying positional embedding and may cache K without embedding it first. |
+| layer_idx | int | 模型中的注意力层索引。 |
+| num_heads | int | 查询头数量。 |
+| head_dim | int | 每个注意力头的大小 `(hidden_size // num_heads)`。 |
+| num_kv_heads | Optional[int] | KV 头数量。为 None 时默认为 num_heads。 |
+| quant_config | QuantConfig | 可选的量化配置。为 None 时不应用量化。 |
+| pos_embd_params | PositionalEmbeddingParams | 可选参数，定义如何应用位置嵌入。为 None 时，模型应在调用后端前应用位置嵌入。否则，后端负责应用位置嵌入，并且可以先缓存 K 而不加嵌入。 |
 
-Its `forward` accepts the following arguments:
+其 `forward` 接受以下参数：
 
-| Field | Type | Description |
+| 字段 | 类型 | 描述 |
 | ----- | ---- | ----------- |
-| q | Tensor | Query tensor with shape `(num_tokens, num_heads * head_dim)`. |
-| k | Tensor | Key tensor with shape `(num_tokens, num_kv_heads * head_dim)`. |
-| v | Tensor | Value tensor with shape `(num_tokens, num_kv_heads * head_dim)`. |
-| metadata | AttentionMetadata | Metadata for the attention operation. |
-| forward_args | AttentionForwardArgs | Optional per-forward arguments such as the attention mask, output buffers and scales, RoPE and MRoPE inputs, MLA buffers, and sparse-attention inputs. |
-| **kwargs | Any | Temporary compatibility path for fields declared by `AttentionForwardArgs`; unknown fields raise an error. |
+| q | Tensor | 查询张量，形状 `(num_tokens, num_heads * head_dim)`。 |
+| k | Tensor | 键张量，形状 `(num_tokens, num_kv_heads * head_dim)`。 |
+| v | Tensor | 值张量，形状 `(num_tokens, num_kv_heads * head_dim)`。 |
+| metadata | AttentionMetadata | 注意力操作的元数据。 |
+| forward_args | AttentionForwardArgs | 可选的每前向参数，如注意力掩码、输出缓冲区和缩放因子、RoPE 和 MRoPE 输入、MLA 缓冲区以及稀疏注意力输入。 |
+| **kwargs | Any | 为 `AttentionForwardArgs` 声明的字段提供的临时兼容路径；未知字段会报错。 |
 
-For example, the FlashInfer backend calls `append_paged_kv_cache` when it owns the KV-cache update, then calls the prefill, decode, or ragged-prefill wrapper's `run` method using the plan cached in `FlashInferAttentionMetadata`.
+例如，FlashInfer 后端在它拥有 KV cache 更新权时调用 `append_paged_kv_cache`，然后使用 `FlashInferAttentionMetadata` 中缓存的 plan 调用 prefill、decode 或 ragged-prefill wrapper 的 `run` 方法。

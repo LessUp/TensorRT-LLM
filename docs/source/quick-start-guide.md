@@ -1,43 +1,56 @@
+<!--
+  本文档为 TensorRT-LLM 官方 Quick Start Guide 的中文翻译版（AI 翻译，翻译日期 2026-08-07）。
+  英文原文可从 git 历史恢复：git checkout HEAD -- docs/source/quick-start-guide.md
+-->
+
 (quick-start-guide)=
 
-# Quick Start Guide
+# 快速开始指南
 
-This is the starting point to try out TensorRT LLM. Specifically, this Quick Start Guide enables you to quickly get set up and send HTTP requests using TensorRT LLM.
+这是试用 TensorRT LLM 的起点。本指南让你快速完成环境配置，并通过 HTTP 请求使用 TensorRT LLM。
 
+> 💡 **AI Infra 视角**：整个指南展示了 LLM 推理服务的两种典型使用方式，AI Infra 岗位日常都会碰到：
+> - **在线服务（online serving）**：启动常驻服务进程，对外提供 HTTP/gRPC 接口，支持高并发请求——生产环境的主要形态；
+> - **离线推理（offline inference）**：在 Python 脚本里直接调用引擎做推理（如批量评测、离线生成）——开发调试和批处理任务常用。
+> 转行学习时建议先跑通这两个例子，获得"推理引擎到底怎么用"的第一手感受。
 
-## Install TensorRT LLM
+## 安装 TensorRT LLM
 
-Follow the [Installation Guide](installation/installation-guide) to set up TensorRT LLM. The quickest option is to pull and run the pre-built release container from NGC.
+按照[安装指南](installation/installation-guide)配置 TensorRT LLM。最快的途径是从 NGC 拉取并运行预构建的 release 容器。
+
+> 💡 **AI Infra 视角**：NGC（NVIDIA GPU Cloud）是英伟达的容器/镜像仓库（类似 Docker Hub）。生产环境里常见的安装形态：官方容器镜像（开箱即用，推荐）或 pip 安装（`pip install tensorrt-llm`，依赖本地已装好的 CUDA/TensorRT 环境）。注意 TRT-LLM 依赖特定 CUDA/TensorRT 版本，容器方式能避免环境地狱。
 
 (deploy-with-trtllm-serve)=
-## Deploy Online Serving with trtllm-serve
+## 用 trtllm-serve 部署在线服务
 
-You can use the `trtllm-serve` command to start an OpenAI compatible server to interact with a model.
-To start the server, you can run a command like the following example inside a Docker container:
+你可以使用 `trtllm-serve` 命令启动一个 OpenAI 兼容的服务器来与模型交互。
+要启动服务器，在 Docker 容器内运行类似下面的命令：
 
 ```bash
 trtllm-serve "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 ```
 
-You may also deploy pre-quantized models to improve performance.
-Ensure your GPU supports FP8 quantization before running the following:
+你也可以部署预量化模型来提升性能。
+运行以下命令前请确保你的 GPU 支持 FP8 量化：
 
 ```bash
 trtllm-serve "nvidia/Qwen3-8B-FP8"
 ```
 
-For more options, browse the full [collection of generative models](https://huggingface.co/collections/nvidia/inference-optimized-checkpoints-with-model-optimizer) that have been quantized and optimized for inference with the TensorRT Model Optimizer.
+更多选项请浏览完整的[生成模型集合](https://huggingface.co/collections/nvidia/inference-optimized-checkpoints-with-model-optimizer)，这些模型已使用 TensorRT Model Optimizer 量化和优化，可直接用于推理。
 
 ```{note}
-If you are running `trtllm-serve` inside a Docker container, you have two options for sending API requests:
-1. Expose a port (e.g., 8000) to allow external access to the server from outside the container.
-2. Open a new terminal and use the following command to directly attach to the running container:
+如果你在 Docker 容器内运行 `trtllm-serve`，有两种方式发送 API 请求：
+1. 暴露端口（如 8000），让外部可以访问容器内的服务器。
+2. 打开新终端，用以下命令直接进入运行中的容器：
 ```bash
 docker exec -it <container_id> bash
 ```
 
-After the server has started, you can access well-known OpenAI endpoints such as `v1/chat/completions`.
-Inference can then be performed using examples similar to the one provided below, from a separate terminal.
+> 💡 **AI Infra 视角**：`trtllm-serve` 只需一个 HuggingFace 模型名就能拉起服务——它内部会自动完成"下载权重 → 加载 → 编译/优化 → 启动服务"整条链路。"OpenAI 兼容"是行业事实标准：各大推理服务（vLLM、Triton、SGLang 等）都实现 OpenAI 的 `/v1/chat/completions` 接口，这样上层应用（LangChain、各种 Agent 框架）无需改动就能切换底层引擎。你在面试和工作中都会反复听到这个词。
+
+服务器启动后，你可以访问著名的 OpenAI 端点，如 `v1/chat/completions`。
+在另一个终端中，可以使用类似下面的示例进行推理：
 
 ```bash
 curl -X POST http://localhost:8000/v1/chat/completions \
@@ -52,7 +65,7 @@ curl -X POST http://localhost:8000/v1/chat/completions \
     }'
 ```
 
-_Example Output_
+_示例输出_
 
 ```json
 {
@@ -81,52 +94,58 @@ _Example Output_
 }
 ```
 
-For detailed examples and command syntax, refer to the [trtllm-serve](commands/trtllm-serve/trtllm-serve.rst) section.
+> 💡 **AI Infra 视角**：响应里的 `usage` 字段值得注意——`prompt_tokens`（输入 token 数）、`completion_tokens`（输出 token 数）、`total_tokens`（总数）。token 计数直接决定你的**计费和成本核算**，也是性能优化时衡量效果的基准。另外 `finish_reason: "stop"` 表示模型因为遇到结束符而正常停止生成（还有 `"length"`=达到 max_tokens、`"eos"` 等情况）。
+
+详细的示例和命令语法，请参考 [trtllm-serve](commands/trtllm-serve/trtllm-serve.rst) 章节。
 
 ```{note}
-Pre-configured settings for deploying popular models with `trtllm-serve` can be found in our [deployment guides](deployment-guide/index.rst).
+使用 `trtllm-serve` 部署热门模型的预配置参数可以在我们的[部署指南](deployment-guide/index.rst)中找到。
 ```
 
-## Run Offline Inference with LLM API
+## 使用 LLM API 进行离线推理
 
-The LLM API is a Python API designed to facilitate setup and inference with TensorRT LLM directly within Python. It enables model optimization by simply specifying a HuggingFace repository name or a model checkpoint. The LLM API streamlines the process by managing model loading, optimization, and inference, all through a single `LLM` instance.
+LLM API 是一个 Python API，旨在直接在 Python 中简化 TensorRT LLM 的设置和推理。只需指定一个 HuggingFace 仓库名或模型 checkpoint，即可完成模型优化。LLM API 通过一个 `LLM` 实例统一管理模型加载、优化和推理的整个流程。
 
-Here is a simple example to show how to use the LLM API with TinyLlama.
+下面是一个使用 LLM API 运行 TinyLlama 的简单示例。
 
 ```{literalinclude} ../../examples/llm-api/quickstart_example.py
     :language: python
     :linenos:
 ```
 
-You can also directly load pre-quantized models [quantized checkpoints on Hugging Face](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4) in the LLM constructor.
-To learn more about the LLM API, check out the [](llm-api/index) and [](examples/llm_api_examples).
+你也可以在 `LLM` 构造函数中直接加载预量化模型，如 [Hugging Face 上的量化 checkpoint](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4)。
+想进一步了解 LLM API，请查看 [](llm-api/index) 和 [](examples/llm_api_examples)。
 
+> 💡 **AI Infra 视角**：LLM API 的"一个对象管全部"设计（模型加载 + 优化 + 推理）是推理引擎的经典抽象。理解它背后的流程对调试很有帮助：
+> 1. `LLM(model=...)` 构造时：下载/加载权重 → 按配置做并行切分、量化等优化 → 构建执行器；
+> 2. `llm.generate(...)` 调用时：进入请求调度（scheduler）→ 前向推理（forward）→ 采样（sampling）→ 返回结果。
+> 后续学习路线会沿着这条链路逐层深入（阶段 1 讲调度与 KV cache，阶段 4 讲 PyTorch 后端实现）。
 
-## Run Offline Inference with VisualGen API
+## 使用 VisualGen API 进行离线推理
 
-The VisualGen API provides a similar interface for diffusion-based image and video generation. Here is a simple example to generate a video with Wan 2.1.
+VisualGen API 为基于扩散模型的图像和视频生成提供了类似接口。下面是使用 Wan 2.1 生成视频的简单示例。
 
 ```{literalinclude} ../../examples/visual_gen/quickstart_example.py
     :language: python
     :linenos:
 ```
 
-To learn more about VisualGen, check out the [Visual Generation](models/visual-generation.md) documentation and [`examples/visual_gen/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen).
+想进一步了解 VisualGen，请查看[视觉生成](models/visual-generation.md)文档和 [`examples/visual_gen/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen)。
 
-## Next Steps
+## 下一步
 
-In this Quick Start Guide, you have:
+在本快速开始指南中，你已经：
 
-- Learned how to deploy a model with `trtllm-serve` for online serving
-- Explored the LLM API for offline inference with TensorRT LLM
+- 学会了如何用 `trtllm-serve` 部署模型进行在线服务
+- 探索了用 LLM API 进行 TensorRT LLM 离线推理
 
-To continue your journey with TensorRT LLM, explore these resources:
+继续你的 TensorRT LLM 之旅，可以探索以下资源：
 
-- **[Installation Guide](installation/index.rst)** - Detailed installation instructions for different platforms
-- **[Model-Specific Deployment Guides](deployment-guide/index.rst)** - Instructions for serving specific models with TensorRT LLM
-- **[Deployment Guide](examples/llm_api_examples)** - Comprehensive examples for deploying LLM inference in various scenarios
-- **[Model Support](models/supported-models.md)** - Check which models are supported and how to add new ones
-- **CLI Reference** - Explore TensorRT LLM command-line tools:
-  - [`trtllm-serve`](commands/trtllm-serve/trtllm-serve.rst) - Deploy models for online serving
-  - [`trtllm-bench`](commands/trtllm-bench.rst) - Benchmark model performance
-  - [`trtllm-eval`](commands/trtllm-eval.rst) - Evaluate model accuracy
+- **[安装指南](installation/index.rst)** - 不同平台的详细安装说明
+- **[模型专属部署指南](deployment-guide/index.rst)** - 使用 TensorRT LLM 服务特定模型的说明
+- **[部署指南](examples/llm_api_examples)** - 各种场景下部署 LLM 推理的全面示例
+- **[模型支持](models/supported-models.md)** - 查看支持的模型以及如何添加新模型
+- **CLI 参考** - 探索 TensorRT LLM 命令行工具：
+  - [`trtllm-serve`](commands/trtllm-serve/trtllm-serve.rst) - 部署模型进行在线服务
+  - [`trtllm-bench`](commands/trtllm-bench.rst) - 模型性能基准测试
+  - [`trtllm-eval`](commands/trtllm-eval.rst) - 模型准确率评估

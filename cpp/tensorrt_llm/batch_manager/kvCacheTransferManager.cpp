@@ -28,6 +28,25 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
+// ============================================================================
+// 【中文讲解 · KV Cache 传输管理器 kvCacheTransferManager】（本文件为学习用途添加）
+//
+// 对应文档：docs/source/features/disagg-serving.md（分离式服务）
+//
+// 职责：在分离式服务（disaggregated serving）中，把 prefill 实例算好的
+//       KV cache 块传输给 decode 实例（ctx→gen 的 KV 交换）。
+//
+// 关键点：
+//   1. 传输时机：prefill 完成后立刻发起，decode 实例收到后才能开始生成；
+//   2. 零拷贝优化：TRTLLM_TRY_ZCOPY_FOR_KVCACHE_TRANSFER 等环境变量
+//      （见 disagg-serving.md 的环境变量章节）控制是否绕过临时缓冲直接传；
+//   3. 重叠优化：不同请求的 KV 传输与计算重叠，隐藏传输延迟；
+//   4. 布局转换：prefill 用 TP、decode 用 PP 时，KV 块布局不同，
+//      传输过程中需要重排（见 disagg-serving.md 的 Cache Layout Transformation）。
+//
+// 传输后端的抽象（BackendType）：DEFAULT / UCX / NIXL / MPI，
+// 由 cache_transceiver_config.backend 配置选择。
+// ============================================================================
 
 namespace tr = tensorrt_llm::runtime;
 namespace tk = tensorrt_llm::kernels;

@@ -25,6 +25,24 @@
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/utils/mpiTags.h"
+// ============================================================================
+// 【中文讲解 · 解码器缓冲区 decoderBuffers】（本文件为学习用途添加）
+//
+// 对应文档：docs/source/developer-guide/overview.md（Decoder 组件）
+//
+// 职责：管理解码阶段（decode）所需的一组 GPU 缓冲区（tensors）。
+//
+// 解码器一次前向需要哪些缓冲？
+//   - logits 缓冲区：模型输出的原始分数（采样器的输入）；
+//   - 采样参数缓冲区：temperature/top_k/top_p 等（按请求排列）；
+//   - 输出 token 缓冲区：解码器生成的 token id；
+//   - 辅助缓冲：beam search 的 cache_indirection、投机解码的草稿缓冲等。
+//
+// 设计要点：这些缓冲按 max_batch_size × max_beam_width 预分配（固定大小），
+// 与 CUDA Graph 配合（图捕获要求地址/形状稳定）。
+// 缓冲的分配策略直接影响显存占用——这是"每请求一步"的 decode 路径上的
+// 高频数据结构。
+// ============================================================================
 
 using namespace tensorrt_llm::runtime;
 
